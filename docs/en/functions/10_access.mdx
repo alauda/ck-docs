@@ -1,0 +1,157 @@
+---
+weight: 10
+---
+
+# Access the instance
+
+Clients reach Alauda Data Services Analytical Database E1 through Services created by the operator, authenticating as users you declare in the instance spec.
+
+## Services
+
+Two kinds of Service are created by default:
+
+| Service | Name | Shape | Use |
+| --- | --- | --- | --- |
+| Instance-wide | `clickhouse-<instance>` | `LoadBalancer`, external traffic policy `Local` | Entry point for clients. Selects only ready hosts. |
+| Per host | `chi-<instance>-<cluster>-<shard>-<replica>` | Headless (`ClusterIP: None`), publishes not-ready addresses | Stable per-pod DNS. Used for replication and for targeting one host. |
+
+Cluster-level and shard-level Services are **not** created unless you supply a `clusterServiceTemplate` or `shardServiceTemplate`. Without those templates no such object exists, so do not write client configuration against their names.
+
+:::warning
+The instance-wide Service defaults to type `LoadBalancer`. On a cluster with no load balancer provider it will sit without an external address indefinitely. If you want in-cluster access only, override the type with a service template:
+
+```yaml
+spec:
+  defaults:
+    templates:
+      serviceTemplate: internal
+  templates:
+    serviceTemplates:
+      - name: internal
+        spec:
+          type: ClusterIP
+          ports:
+            - name: http
+              port: 8123
+            - name: tcp
+              port: 9000
+```
+
+Port numbers in a service template are validated and must be between 1 and 65535.
+:::
+
+## Ports
+
+| Port | Name | Protocol |
+| --- | --- | --- |
+| 8123 | `http` | HTTP interface |
+| 9000 | `tcp` | Native protocol |
+| 9009 | `interserver` | Replica-to-replica data exchange. Not a client port. |
+
+## Connecting
+
+In-cluster, native protocol:
+
+```bash
+kubectl -n <namespace> run ch-client --rm -it --restart=Never \
+  --image=<server-image> -- \
+  clickhouse-client -h clickhouse-<instance>.<namespace>.svc.cluster.local \
+  -u <user> --password <password>
+```
+
+In-cluster, HTTP:
+
+```bash
+curl "http://clickhouse-<instance>.<namespace>.svc.cluster.local:8123/" \
+  -u "<user>:<password>" --data-binary "SELECT version()"
+```
+
+Targeting one specific host, for example to inspect a single replica:
+
+```bash
+kubectl -n <namespace> exec chi-<instance>-<cluster>-0-0-0 -c clickhouse -- \
+  clickhouse-client -q "SELECT hostName(), uptime()"
+```
+
+## Users
+
+Users, profiles and quotas are declared under `spec.configuration` and rendered into the server's `users.d` directory. Settings under `spec.configuration.settings` are rendered into `config.d` instead.
+
+```yaml
+apiVersion: clickhouse.altinity.com/v1
+kind: ClickHouseInstallation
+metadata:
+  name: e1-users
+spec:
+  configuration:
+    users:
+      # plain password — acceptable only for non-production
+      app/password: <password>
+      app/networks/ip:
+        - "10.0.0.0/8"
+      app/profile: app_profile
+      app/quota: app_quota
+      app/allow_databases/database:
+        - analytics
+      # preferred: SHA-256 hex of the password
+      admin/password_sha256_hex: <sha256-hex>
+      admin/networks/ip:
+        - "::/0"
+      reporting/profile: readonly
+    profiles:
+      app_profile/max_memory_usage: "10000000000"
+      readonly/readonly: "1"
+    quotas:
+      app_quota/interval/duration: "3600"
+    clusters:
+      - name: main
+        layout:
+          shardsCount: 1
+          replicasCount: 1
+```
+
+The key syntax is path-like: everything before the first `/` is the user, profile or quota name, and the rest is the XML path beneath it. Repeat a key with a list value to emit multiple elements.
+
+Produce a password hash with:
+
+```bash
+printf '%s' '<password>' | sha256sum | cut -d' ' -f1
+```
+
+### The `default` user is restricted on purpose
+
+The shipped operator defaults give the `default` user the `default` profile, the `default` quota, and a network allow-list of `::1` and `127.0.0.1` only. It is therefore not usable from other pods. Declare your own user rather than loosening `default`.
+
+A host regular expression is also applied by default, restricting inbound connections to names matching the instance's own pods and its instance-wide Service within the same namespace. If you widen `networks/ip` and connections are still refused, this is the second gate to look at.
+
+### The operator's own account
+
+The operator connects to each server to read metrics, maintain schema and drop DNS caches. It uses its own account, whose credentials it reads from a Secret named in the operator configuration, over the HTTP port with short connect and query timeouts. Do not remove or repurpose that account: without it, schema propagation and metrics collection stop.
+
+## Cluster shared secret
+
+Interserver communication inside a cluster can be authenticated with a shared secret, declared per cluster:
+
+```yaml
+spec:
+  configuration:
+    clusters:
+      - name: main
+        secret:
+          auto: "yes"
+        layout:
+          shardsCount: 2
+          replicasCount: 2
+```
+
+`auto: "yes"` makes the operator generate the value and store it in a Secret it manages. Alternatively supply `value` in plain text, or `valueFrom.secretKeyRef` pointing at a Secret in the same namespace as the instance. Prefer `auto` or `secretKeyRef`; `value` puts the secret into the instance manifest.
+
+## Files
+
+Arbitrary configuration files can be injected with `spec.configuration.files`, where each key is a filename and the value is its content. Binary content is supported with the YAML `!!binary` tag. A filename may be prefixed to choose its destination directory — common, users, or host. Unknown prefixes and subfolders are ignored, so a file that never appears is usually a prefix typo.
+
+---
+
+ClickHouse is a registered trademark of ClickHouse, Inc. https://clickhouse.com
+
+Alauda is an independent vendor. This product is not affiliated with, endorsed by, or sponsored by ClickHouse, Inc. All trademarks are the property of their respective owners and are used here for identification purposes only.

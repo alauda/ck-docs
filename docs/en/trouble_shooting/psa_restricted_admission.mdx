@@ -1,0 +1,120 @@
+---
+weight: 2
+---
+
+# Pod rejected under Pod Security Admission
+
+## Symptom
+
+An instance is created, the StatefulSets appear, but no pods are created. The StatefulSet reports a failure to create pods, with a Pod Security Admission violation naming the `restricted` profile. Typical wording in events:
+
+```
+create Pod chi-<instance>-<cluster>-0-0-0 in StatefulSet chi-<instance>-<cluster>-0-0 failed error:
+pods "chi-<instance>-<cluster>-0-0-0" is forbidden: violates PodSecurity "restricted:latest"
+```
+
+The instance's own status may show no error, because the objects the operator submitted were accepted; it is the pods that are refused.
+
+Reproduce the condition by checking the namespace labels:
+
+```bash
+kubectl get ns <namespace> -o jsonpath='{.metadata.labels}'
+```
+
+A `pod-security.kubernetes.io/enforce: restricted` label is the trigger.
+
+## Cause
+
+Setting `logVolumeClaimTemplate` changes the pod's shape: the operator appends a second container named `clickhouse-log` so the log volume can be read without disturbing the server. The container it generates sets only a user id in its security context. It does not set `allowPrivilegeEscalation: false`, drop capabilities, or set a seccomp profile, and the `restricted` profile requires all of those.
+
+Every other container in the pod can be fully compliant and the pod is still rejected, because admission judges the whole pod.
+
+## Fix
+
+Declare the log container yourself in the pod template, with a complete security context. When a container with that exact name already exists, the operator reuses yours instead of generating one — it only fills in the image if you left it empty or set it to `default`.
+
+```yaml
+apiVersion: clickhouse.altinity.com/v1
+kind: ClickHouseInstallation
+metadata:
+  name: e1-logs
+spec:
+  defaults:
+    templates:
+      dataVolumeClaimTemplate: data-volume
+      logVolumeClaimTemplate: log-volume
+      podTemplate: ch-pod
+  configuration:
+    clusters:
+      - name: main
+        layout:
+          shardsCount: 1
+          replicasCount: 1
+  templates:
+    podTemplates:
+      - name: ch-pod
+        spec:
+          securityContext:
+            runAsUser: 101
+            runAsGroup: 101
+            fsGroup: 101
+            runAsNonRoot: true
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: clickhouse
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop:
+                    - ALL
+            - name: clickhouse-log
+              securityContext:
+                runAsUser: 65534
+                runAsNonRoot: true
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop:
+                    - ALL
+                seccompProfile:
+                  type: RuntimeDefault
+    volumeClaimTemplates:
+      - name: data-volume
+        spec:
+          accessModes:
+            - ReadWriteOnce
+          resources:
+            requests:
+              storage: 50Gi
+      - name: log-volume
+        spec:
+          accessModes:
+            - ReadWriteOnce
+          resources:
+            requests:
+              storage: 10Gi
+```
+
+The name must be exactly `clickhouse-log`. A different name leaves you with both your sidecar and the operator's generated container, and the rejection stands.
+
+## Alternative: do not persist logs
+
+If you do not need logs on a volume, remove `logVolumeClaimTemplate`. Without it the operator does not add the log container at all, and mounts an `emptyDir` at the log directory instead. Logs are then readable for the life of the pod and lost when it is replaced.
+
+## Verify
+
+```bash
+kubectl -n <namespace> get pods -l clickhouse.altinity.com/chi=<instance>
+kubectl -n <namespace> get pod <pod> \
+  -o jsonpath='{range .spec.containers[*]}{.name}{"\t"}{.securityContext}{"\n"}{end}'
+```
+
+Two containers, `clickhouse` and `clickhouse-log`, both with a complete security context.
+
+---
+
+ClickHouse is a registered trademark of ClickHouse, Inc. https://clickhouse.com
+
+Alauda is an independent vendor. This product is not affiliated with, endorsed by, or sponsored by ClickHouse, Inc. All trademarks are the property of their respective owners and are used here for identification purposes only.

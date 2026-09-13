@@ -1,0 +1,77 @@
+---
+weight: 35
+---
+
+# Monitoring
+
+Alauda Data Services Analytical Database E1 exposes Prometheus metrics through a metrics exporter that runs alongside the operator. The exporter is a separate binary from the operator itself, shipped as a second container in the operator pod.
+
+## Endpoint
+
+| Path | Serves |
+| --- | --- |
+| `/metrics` | Prometheus metrics scraped from every instance the operator watches. |
+| `/chi` | The list of instances currently discovered. Useful for confirming an instance is being monitored at all. |
+
+Both are served on port `8888`. The operator pod carries a port named `metrics` on 8888 and Prometheus scrape annotations, and a Service is created in front of it so a cluster-wide Prometheus can discover it.
+
+Check it directly:
+
+```bash
+kubectl -n <operator-namespace> port-forward deploy/clickhouse-operator 8888:8888
+curl -s localhost:8888/chi
+curl -s localhost:8888/metrics | head -40
+```
+
+If an instance you expect is absent from `/chi`, the operator is not watching its namespace. Namespace scoping is an operator configuration setting; an empty list means all namespaces.
+
+The exporter's listen addresses can be changed with its `-metrics-endpoint` and `-chi-list-endpoint` flags, and it also accepts `-config`, `-kubeconfig`, `-master` and `-version`. Changing them means changing the operator Deployment, so leave them at their defaults unless you have a port conflict.
+
+## What is collected
+
+The exporter connects to each instance over the HTTP port using the operator's own account and reads the server's system tables:
+
+| Source | Provides |
+| --- | --- |
+| `system.metrics` | Current gauges — connections, active merges, memory tracking. |
+| `system.events` | Cumulative counters — queries, reads, writes, exceptions. |
+| `system.asynchronous_metrics` | Periodically sampled values, including filesystem and memory figures. |
+| `system.parts` | Part counts and sizes per table. The practical signal for storage growth. |
+| `system.replicas` | Replication health — queue sizes, absolute delay, read-only replicas. |
+| `system.mutations` | In-flight and failed mutations. |
+
+Collection is a pull from the exporter to each server, so an instance that is unreachable produces gaps rather than errors in your dashboards.
+
+## Metrics worth alerting on
+
+- **Replication delay and queue growth**, from the `system.replicas` series. Sustained growth means a replica is falling behind or stuck, and it will not resolve itself.
+- **Read-only replicas**, also from `system.replicas`. Usually indicates loss of the coordination quorum. See [Configure a replicated cluster](../how_to/configure_replicated_cluster.mdx).
+- **Rejected or failed queries**, from the `system.events` counters.
+- **Part counts per table**, from `system.parts`. A climbing part count with no corresponding merge activity means merges are not keeping up.
+- **Memory tracking against the container limit**, from `system.metrics` and `system.asynchronous_metrics`. See [Server pods OOMKilled during merges](../trouble_shooting/oom_during_merges.mdx).
+
+## Instance health is not a metric
+
+The exporter reports what the servers report about themselves. It does not tell you whether the desired topology is running. For that, compare desired and ready replicas on the StatefulSets:
+
+```bash
+kubectl -n <namespace> get statefulset -l clickhouse.altinity.com/chi=<instance> \
+  -o custom-columns=NAME:.metadata.name,DESIRED:.spec.replicas,READY:.status.readyReplicas
+```
+
+That comparison is the same readiness test the operator applies internally, which makes it the authoritative check.
+
+## Operator logs
+
+```bash
+kubectl -n <operator-namespace> logs deploy/clickhouse-operator -c clickhouse-operator
+kubectl -n <operator-namespace> logs deploy/clickhouse-operator -c metrics-exporter
+```
+
+Reconcile decisions are in the first container; scrape failures are in the second.
+
+---
+
+ClickHouse is a registered trademark of ClickHouse, Inc. https://clickhouse.com
+
+Alauda is an independent vendor. This product is not affiliated with, endorsed by, or sponsored by ClickHouse, Inc. All trademarks are the property of their respective owners and are used here for identification purposes only.

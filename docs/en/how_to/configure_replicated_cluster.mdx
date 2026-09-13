@@ -1,0 +1,201 @@
+---
+weight: 1
+---
+
+# Configure a replicated cluster
+
+This page builds a 2 shard x 2 replica cluster of Alauda Data Services Analytical Database E1 and creates a replicated table on it.
+
+## What replication requires
+
+Replication and cluster-wide DDL both need a ZooKeeper-compatible coordination quorum. **You supply it.** The operator does not deploy, scale or manage a quorum, and there is no custom resource for one. You give the instance the addresses of a quorum that already exists.
+
+About Keeper specifically:
+
+- The delivered server image's `clickhouse` binary is multi-call and includes a `keeper` subcommand, so the coordination service is part of the same binary that runs the server. There is no separate coordination image in this product.
+- There is no custom resource representing a coordination quorum, and nothing in the operator reconciles one. If you choose to run a quorum from the same image, you own its workload, its storage and its configuration, exactly as you would for any other stateful service.
+
+Whichever quorum you use, the instance only ever learns about it as a list of host addresses.
+
+## The instance
+
+```yaml
+apiVersion: clickhouse.altinity.com/v1
+kind: ClickHouseInstallation
+metadata:
+  name: e1-repl
+spec:
+  defaults:
+    templates:
+      dataVolumeClaimTemplate: data-volume
+      podTemplate: ch-pod
+  configuration:
+    zookeeper:
+      nodes:
+        - host: keeper-0.keeper-headless.<quorum-namespace>
+        - host: keeper-1.keeper-headless.<quorum-namespace>
+        - host: keeper-2.keeper-headless.<quorum-namespace>
+    clusters:
+      - name: main
+        layout:
+          shardsCount: 2
+          replicasCount: 2
+  templates:
+    podTemplates:
+      - name: ch-pod
+        podDistribution:
+          - type: ShardAntiAffinity
+        spec:
+          securityContext:
+            runAsUser: 101
+            runAsGroup: 101
+            fsGroup: 101
+            runAsNonRoot: true
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: clickhouse
+              resources:
+                requests:
+                  cpu: "2"
+                  memory: 8Gi
+                limits:
+                  cpu: "4"
+                  memory: 16Gi
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop:
+                    - ALL
+    volumeClaimTemplates:
+      - name: data-volume
+        spec:
+          accessModes:
+            - ReadWriteOnce
+          resources:
+            requests:
+              storage: 200Gi
+```
+
+Notes:
+
+- `port` under each node defaults to 2181, so you only need `host` for a standard quorum.
+- `shardsCount: 2` with `replicasCount: 2` is four hosts. Each host is its own StatefulSet with one pod, so you get four pods and four data volumes.
+- The quorum may live in another namespace. Use its fully qualified address if so.
+- A cluster can override the instance-wide quorum with its own `zookeeper` block, which is how two clusters in one instance can use separate quorums.
+
+Apply it and wait for all four hosts:
+
+```bash
+kubectl -n <namespace> apply -f e1-repl.yaml
+kubectl -n <namespace> get statefulset -l clickhouse.altinity.com/chi=e1-repl \
+  -o custom-columns=NAME:.metadata.name,DESIRED:.spec.replicas,READY:.status.readyReplicas
+```
+
+## Confirm the cluster and the quorum
+
+```sql
+SELECT cluster, shard_num, replica_num, host_name
+FROM system.clusters
+WHERE cluster = 'main'
+ORDER BY shard_num, replica_num;
+```
+
+Four rows, two shards, two replicas each.
+
+Then confirm the server can actually reach the quorum:
+
+```sql
+SELECT name FROM system.zookeeper WHERE path = '/';
+```
+
+If that query fails, stop here and fix coordination before creating any replicated table. See [ON CLUSTER DDL fails with NO_ELEMENTS_IN_CONFIG](../trouble_shooting/on_cluster_no_elements_in_config.mdx).
+
+## Macros
+
+The operator writes per-host macros into each host's configuration, so table definitions can be written once and applied to every host:
+
+| Macro | Value |
+| --- | --- |
+| `{installation}` | Instance name. |
+| `{cluster}` | Cluster name. |
+| `{shard}` | Shard name of this host. |
+| `{replica}` | This host's own hostname. |
+
+Use them in replication paths rather than hard-coding host names.
+
+## Create a replicated table
+
+```sql
+CREATE DATABASE IF NOT EXISTS analytics ON CLUSTER '{cluster}';
+
+CREATE TABLE IF NOT EXISTS analytics.events ON CLUSTER '{cluster}'
+(
+    ts    DateTime,
+    id    UInt64,
+    kind  LowCardinality(String),
+    value Float64
+)
+ENGINE = ReplicatedMergeTree('/clickhouse/tables/{shard}/analytics/events', '{replica}')
+PARTITION BY toYYYYMM(ts)
+ORDER BY (kind, ts, id);
+```
+
+The two `ReplicatedMergeTree` arguments are the coordination path and the replica identity. Both replicas of a shard must share the path and differ in identity, which the macros guarantee.
+
+To query across shards, add a `Distributed` table over the same schema:
+
+```sql
+CREATE TABLE IF NOT EXISTS analytics.events_all ON CLUSTER '{cluster}'
+AS analytics.events
+ENGINE = Distributed('{cluster}', analytics, events, rand());
+```
+
+Write to `analytics.events` on a shard, or to `analytics.events_all` to distribute writes.
+
+## ON CLUSTER needs the coordination element
+
+`ON CLUSTER` is not a client-side convenience. The server broadcasts the statement through the coordination quorum, so it requires the quorum element to be present in the server configuration.
+
+The operator only emits that element when the instance declares coordination nodes. An instance with no `zookeeper.nodes` gets no coordination element at all, and then every `ON CLUSTER` statement fails with `NO_ELEMENTS_IN_CONFIG` — even though distributed DDL itself is enabled in the stock server configuration. The missing piece is always the coordination element.
+
+If you cannot use `ON CLUSTER`, run the `CREATE` statement on each host individually. Prefer `ON CLUSTER` once coordination is in place.
+
+## Schema propagation when you add hosts
+
+When you grow the topology, the operator propagates existing schema to new hosts during reconcile. It reads the object definitions from the hosts that already have them, rewrites each `CREATE` into a `CREATE ... IF NOT EXISTS`, and executes it on the new host. Replicated objects and views are what it propagates; it needs at least two hosts in a shard before there is anything to copy.
+
+This behaviour is governed by `schemaPolicy`:
+
+```yaml
+spec:
+  configuration:
+    clusters:
+      - name: main
+        schemaPolicy:
+          replica: All
+          shard: All
+```
+
+`replica` accepts `None` or `All`. `shard` accepts `None`, `All` or `DistributedTablesOnly`. Both default to `All`. Set `replica: None` to take over schema management yourself.
+
+## Scaling
+
+Raise `replicasCount` to add a replica to every shard, or `shardsCount` to add shards. The operator reconciles hosts one at a time: it excludes a host from the cluster, applies changes, waits for it to be ready, then includes it again. Adding a shard does not redistribute existing data; plan that separately.
+
+## Verify replication is healthy
+
+```sql
+SELECT database, table, is_readonly, absolute_delay, queue_size
+FROM system.replicas
+ORDER BY absolute_delay DESC;
+```
+
+`is_readonly = 1` means the replica has lost coordination. A growing `queue_size` or `absolute_delay` means a replica is falling behind. Both are worth alerting on — see [Monitoring](../functions/35_monitor.mdx).
+
+---
+
+ClickHouse is a registered trademark of ClickHouse, Inc. https://clickhouse.com
+
+Alauda is an independent vendor. This product is not affiliated with, endorsed by, or sponsored by ClickHouse, Inc. All trademarks are the property of their respective owners and are used here for identification purposes only.

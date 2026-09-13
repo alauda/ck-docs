@@ -1,0 +1,103 @@
+---
+weight: 1
+---
+
+# Instance reports Completed while pods are unhealthy
+
+## Symptom
+
+`kubectl get chi` shows `Completed`, but pods are restarting, stuck in `CrashLoopBackOff`, or missing. Clients fail to connect while the instance looks healthy.
+
+## Cause
+
+`status.status` describes the operator's reconcile pass, not the running state of the database. In earlier releases the pass was marked complete once the operator had submitted every object, without waiting for the resulting pods to become ready. A manifest that produced pods which could never start therefore ended in `Completed`.
+
+This release closes that gap in two places:
+
+- A reconcile pass does not complete until every host's StatefulSet reports its desired replicas as ready.
+- If a host degrades after the pass completed, the status is moved back to `InProgress`, and returns to `Completed` when the host recovers.
+
+So on this release a persistent `Completed` with failing pods is unexpected. When you see it, suspect the status is describing a spec generation older than the one you applied.
+
+## Check real health
+
+Always confirm against the workload:
+
+```bash
+kubectl -n <namespace> get statefulset -l clickhouse.altinity.com/chi=<instance> \
+  -o custom-columns=NAME:.metadata.name,DESIRED:.spec.replicas,READY:.status.readyReplicas
+
+kubectl -n <namespace> get pods -l clickhouse.altinity.com/chi=<instance>
+```
+
+Every StatefulSet must show `READY` equal to `DESIRED`. That comparison is the operator's own definition of a ready host, which makes it authoritative regardless of what the status field says.
+
+Then read the status trail for what the operator last did and last failed at:
+
+```bash
+kubectl -n <namespace> get chi <instance> -o jsonpath='{.status.status}{"\n"}'
+kubectl -n <namespace> get chi <instance> -o jsonpath='{.status.errors}' | tr ',' '\n'
+kubectl -n <namespace> get chi <instance> -o jsonpath='{.status.actions}' | tr ',' '\n'
+```
+
+Both trails keep only the ten most recent entries, so treat them as a recent trail rather than a history.
+
+## Find the real cause
+
+The status being stale is rarely the actual problem. Identify why the pod cannot run:
+
+```bash
+kubectl -n <namespace> describe pod <pod>
+kubectl -n <namespace> logs <pod> -c clickhouse --previous
+kubectl -n <namespace> get events --sort-by=.lastTimestamp | tail -30
+```
+
+Three causes account for most of these:
+
+| Evidence | Cause |
+| --- | --- |
+| `ImagePullBackOff`, `ErrImagePull` | A pod template names an image that does not exist or cannot be pulled. |
+| Server exits immediately, configuration error in the log | An invalid entry under `spec.configuration.settings`. An unrecognised setting path is written to the server configuration as given, and the server refuses to start. |
+| `OOMKilled`, exit code 137 | The container memory limit is too small. See [Server pods OOMKilled during merges](oom_during_merges.mdx). |
+
+For a pod template with a bad image, note that the operator applies pod templates per replica, so a wrong image in one template can leave some hosts healthy and others failing — which is exactly the shape that produces a confusing overall status.
+
+## Keep a failing pod alive to inspect it
+
+When the server exits too fast to debug, set the troubleshoot flag:
+
+```bash
+kubectl -n <namespace> patch chi <instance> --type=merge -p '{"spec":{"troubleshoot":"1"}}'
+```
+
+The operator then keeps the container alive after the entrypoint fails, and removes the liveness and readiness probes so the pod is not killed while you work. Exec in, read the configuration the operator generated, and fix the spec:
+
+```bash
+kubectl -n <namespace> exec <pod> -c clickhouse -- \
+  ls -l /etc/clickhouse-server/config.d /etc/clickhouse-server/users.d /etc/clickhouse-server/conf.d
+```
+
+Remove the flag afterwards. While it is set the pod has no probes, so the instance will report ready hosts that are not serving.
+
+## Recover
+
+Fix the spec and re-apply. A failed update rolls back by default, so reverting the offending field and re-applying is the normal path out.
+
+Two operator defaults are worth knowing when a reconcile looks stuck:
+
+- A failed StatefulSet **update** rolls back, with a five minute timeout and a five second poll interval.
+- A failed StatefulSet **create** is ignored, so the operator moves on to the next host rather than blocking the whole instance.
+
+## Confirm recovery
+
+```bash
+kubectl -n <namespace> get statefulset -l clickhouse.altinity.com/chi=<instance> \
+  -o custom-columns=NAME:.metadata.name,DESIRED:.spec.replicas,READY:.status.readyReplicas
+kubectl -n <namespace> exec <pod> -c clickhouse -- clickhouse-client -q "SELECT 1"
+```
+
+---
+
+ClickHouse is a registered trademark of ClickHouse, Inc. https://clickhouse.com
+
+Alauda is an independent vendor. This product is not affiliated with, endorsed by, or sponsored by ClickHouse, Inc. All trademarks are the property of their respective owners and are used here for identification purposes only.

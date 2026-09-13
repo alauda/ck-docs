@@ -1,0 +1,97 @@
+---
+weight: 3
+---
+
+# ON CLUSTER DDL fails with NO_ELEMENTS_IN_CONFIG
+
+## Symptom
+
+Any statement using `ON CLUSTER` fails immediately:
+
+```
+Code: 139. DB::Exception: There is no Zookeeper configuration in server config.
+(NO_ELEMENTS_IN_CONFIG)
+```
+
+Plain single-host DDL works. `CREATE TABLE ... ENGINE = ReplicatedMergeTree(...)` fails for the same reason.
+
+## Cause
+
+`ON CLUSTER` is executed by broadcasting the statement through a coordination quorum, so the server needs a coordination element in its configuration. The operator writes that element only when the instance declares coordination nodes. With no nodes declared, nothing is written, and the server has nowhere to broadcast to.
+
+Distributed DDL itself is enabled in the stock server configuration, so this is not a setting you have to switch on. The missing piece is always the coordination element.
+
+## Confirm
+
+Check whether the instance declares any nodes:
+
+```bash
+kubectl -n <namespace> get chi <instance> \
+  -o jsonpath='{.spec.configuration.zookeeper}{"\n"}'
+```
+
+Empty output is the answer.
+
+Check what reached the server:
+
+```bash
+kubectl -n <namespace> exec <pod> -c clickhouse -- \
+  grep -rl zookeeper /etc/clickhouse-server/config.d /etc/clickhouse-server/conf.d
+```
+
+And ask the server directly:
+
+```sql
+SELECT name FROM system.zookeeper WHERE path = '/';
+```
+
+A failure here confirms the server has no coordination configured, or cannot reach what was configured.
+
+## Fix
+
+Declare the quorum. The operator does not deploy one, so it must already exist.
+
+```yaml
+spec:
+  configuration:
+    zookeeper:
+      nodes:
+        - host: keeper-0.keeper-headless.<quorum-namespace>
+        - host: keeper-1.keeper-headless.<quorum-namespace>
+        - host: keeper-2.keeper-headless.<quorum-namespace>
+```
+
+`port` defaults to 2181 and can be omitted for a standard quorum. Other tunables available on the same block are session and operation timeouts, a root path, and an identity for authenticated quorums.
+
+A single cluster inside the instance can also override the instance-wide setting with its own `zookeeper` block.
+
+Apply the change. The operator re-renders the host configuration and rolls the hosts one at a time.
+
+## Verify
+
+```sql
+SELECT name FROM system.zookeeper WHERE path = '/';
+
+CREATE DATABASE IF NOT EXISTS probe ON CLUSTER '{cluster}';
+DROP DATABASE IF EXISTS probe ON CLUSTER '{cluster}';
+```
+
+## If nodes are declared and it still fails
+
+The element is present but unusable. Check, in order:
+
+1. **Name resolution and reachability** from a server pod to each declared address and port.
+2. **Quorum health.** A quorum with no elected leader answers nothing useful. Check its own status.
+3. **Root path.** If you set a root, it must already exist in the quorum; the server does not create it.
+4. **Whether the configuration reached the pod.** Configuration is delivered by mounted ConfigMap, and a mounted ConfigMap update is not instant. The operator has a configurable propagation timeout for exactly this reason. If a pod has old content, wait for the next reconcile or check the operator log.
+
+   ```bash
+   kubectl -n <namespace> exec <pod> -c clickhouse -- getent hosts keeper-0.keeper-headless.<quorum-namespace>
+   kubectl -n <operator-namespace> logs deploy/clickhouse-operator -c clickhouse-operator | tail -50
+   ```
+
+---
+
+ClickHouse is a registered trademark of ClickHouse, Inc. https://clickhouse.com
+
+Alauda is an independent vendor. This product is not affiliated with, endorsed by, or sponsored by ClickHouse, Inc. All trademarks are the property of their respective owners and are used here for identification purposes only.

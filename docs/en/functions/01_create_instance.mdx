@@ -10,7 +10,7 @@ An instance of Alauda Data Services Analytical Database E1 is one `ClickHouseIns
 
 - The operator is installed and running. It is delivered as an OLM bundle whose package name is `clickhouse-operator`, and the shipped install manifests place it in the `operators` namespace.
 - A StorageClass, if you want persistent data. Without a volume claim template the data directory lives in the pod's writable layer and is lost on restart.
-- A running ZooKeeper-compatible quorum, **only** if you need replication or `ON CLUSTER` DDL. See Configure a replicated cluster.
+- A running ZooKeeper-compatible quorum, **only** if you need replication or `ON CLUSTER` DDL. See [Configure a replicated cluster](../how_to/configure_replicated_cluster.mdx).
 
 :::warning
 Do not apply `kustomize-config/samples/sample.yaml` from the operator repository. It hardcodes a namespace, pins a 2021 operand image, and sets a log volume claim template without the matching container security context, so it is rejected on namespaces with Pod Security Admission `restricted`. Use the manifests on this page instead.
@@ -159,7 +159,7 @@ kubectl -n <namespace> exec chi-e1-demo-main-0-0-0 -c clickhouse -- \
   clickhouse-client -q "SELECT 1"
 ```
 
-The instance is healthy when every StatefulSet reports `ReadyReplicas` equal to its desired replica count — that is precisely the readiness test the operator itself uses. See CHI reports Completed while pods are failing for why the status field alone is not sufficient on older releases.
+The instance is healthy when every StatefulSet reports `ReadyReplicas` equal to its desired replica count — that is precisely the readiness test the operator itself uses. See [Instance reports Completed while pods are unhealthy](../trouble_shooting/status_completed_but_pods_unhealthy.mdx) for why the status field alone is not sufficient on older releases.
 
 ---
 

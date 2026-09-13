@@ -1,0 +1,199 @@
+---
+weight: 2
+---
+
+# Use templates
+
+Templates let you declare pod shape, storage and Service shape once and reference them from instances. They come in two forms:
+
+- **Inline templates**, under `spec.templates` of a `ClickHouseInstallation`.
+- **Shared templates**, in a `ClickHouseInstallationTemplate` (CHIT) that instances pull in with `spec.useTemplates`.
+
+The mechanism is the same in both cases; a CHIT is only a way to keep one definition in one place.
+
+## Template kinds
+
+| Pool | Selected by | Controls |
+| --- | --- | --- |
+| `podTemplates` | `templates.podTemplate` | Containers, resources, security context, affinity, tolerations, node selection. |
+| `volumeClaimTemplates` | `templates.dataVolumeClaimTemplate`, `templates.logVolumeClaimTemplate` | Storage class, size, access modes, reclaim policy. |
+| `serviceTemplates` | `templates.serviceTemplate`, `clusterServiceTemplate`, `shardServiceTemplate`, `replicaServiceTemplate` | Service type, ports, annotations. |
+| `hostTemplates` | `templates.hostTemplate` | Per-host ports and settings. |
+
+Selectors are set under `spec.defaults.templates` to apply to the whole instance, and can be overridden at cluster, shard or replica level.
+
+:::note
+`volumeClaimTemplate` (singular) also appears in the schema and is deprecated. Use `dataVolumeClaimTemplate` and `logVolumeClaimTemplate`.
+:::
+
+## Inline pod and volume templates
+
+```yaml
+apiVersion: clickhouse.altinity.com/v1
+kind: ClickHouseInstallation
+metadata:
+  name: e1-templated
+spec:
+  defaults:
+    templates:
+      podTemplate: ch-pod
+      dataVolumeClaimTemplate: data-volume
+  configuration:
+    clusters:
+      - name: main
+        layout:
+          shardsCount: 2
+          replicasCount: 1
+  templates:
+    podTemplates:
+      - name: ch-pod
+        podDistribution:
+          - type: ShardAntiAffinity
+        spec:
+          securityContext:
+            runAsUser: 101
+            runAsGroup: 101
+            fsGroup: 101
+            runAsNonRoot: true
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: clickhouse
+              resources:
+                requests:
+                  cpu: "2"
+                  memory: 8Gi
+                limits:
+                  cpu: "4"
+                  memory: 16Gi
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop:
+                    - ALL
+    volumeClaimTemplates:
+      - name: data-volume
+        reclaimPolicy: Retain
+        spec:
+          accessModes:
+            - ReadWriteOnce
+          resources:
+            requests:
+              storage: 200Gi
+```
+
+Points that matter:
+
+- The server container **must** be named `clickhouse`. A differently named container is an extra sidecar, not the server, and your resources and security context will not apply to the server.
+- Omit `image` in the pod template. With no image set, the operator uses the operand image it was configured with at install time, which is the version the release was validated against. Pinning your own image opts you out of that.
+- `reclaimPolicy: Retain` on a volume claim template keeps the claim when the StatefulSet is deleted. The default is `Delete`.
+- `podDistribution` expresses spreading rules — for example `ShardAntiAffinity` keeps replicas of different shards off the same node — without hand-writing affinity terms.
+
+## Shared templates with a CHIT
+
+Define the template once:
+
+```yaml
+apiVersion: clickhouse.altinity.com/v1
+kind: ClickHouseInstallationTemplate
+metadata:
+  name: standard-pod
+spec:
+  templates:
+    podTemplates:
+      - name: ch-pod
+        spec:
+          securityContext:
+            runAsUser: 101
+            runAsGroup: 101
+            fsGroup: 101
+            runAsNonRoot: true
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: clickhouse
+              resources:
+                requests:
+                  cpu: "2"
+                  memory: 8Gi
+                limits:
+                  cpu: "4"
+                  memory: 16Gi
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop:
+                    - ALL
+```
+
+Reference it from an instance:
+
+```yaml
+spec:
+  useTemplates:
+    - name: standard-pod
+    - name: shared-storage
+      namespace: platform-templates
+  defaults:
+    templates:
+      podTemplate: ch-pod
+```
+
+`useTemplates` entries take a `name`, an optional `namespace`, and an optional `useType` which may be empty or `merge`. Templates are applied in the order listed, and anything set directly on the instance wins over what a template provides. Check the result on the live object — the reconciled spec after defaulting and template merging is published in the instance's status, and that is the fastest way to confirm a template was picked up.
+
+Templates can also be applied automatically to every instance, by marking the CHIT with `spec.templating.policy: auto`. Use this sparingly: it changes instances that do not mention the template at all.
+
+Template files loaded from the operator's own template directory must end in `.yaml` or `.json`, and are read in sorted order. Files with any other extension are ignored.
+
+## The log container escape hatch
+
+When you set `logVolumeClaimTemplate`, the operator appends a container named `clickhouse-log` to the pod. Its generated security context sets a user id and nothing more, which a namespace enforcing the Pod Security Admission `restricted` profile will reject.
+
+Declare that container yourself in the pod template and the operator will reuse yours rather than generating one. It only fills in the image if you left it unset:
+
+```yaml
+  templates:
+    podTemplates:
+      - name: ch-pod
+        spec:
+          securityContext:
+            runAsUser: 101
+            runAsGroup: 101
+            fsGroup: 101
+            runAsNonRoot: true
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: clickhouse
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop:
+                    - ALL
+            - name: clickhouse-log
+              securityContext:
+                runAsUser: 65534
+                runAsNonRoot: true
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop:
+                    - ALL
+                seccompProfile:
+                  type: RuntimeDefault
+```
+
+The container name must match exactly, or you get both your sidecar and the operator's generated one.
+
+## Changing a template
+
+Editing a template referenced by running instances triggers a rolling reconcile of those instances. Hosts are updated one at a time: the operator excludes a host from the cluster, updates its configuration and StatefulSet, waits for it to come back, then includes it again. A change that cannot succeed — an image that does not exist, a memory limit too small to start the server — will therefore stall on the first host rather than breaking every host at once.
+
+---
+
+ClickHouse is a registered trademark of ClickHouse, Inc. https://clickhouse.com
+
+Alauda is an independent vendor. This product is not affiliated with, endorsed by, or sponsored by ClickHouse, Inc. All trademarks are the property of their respective owners and are used here for identification purposes only.

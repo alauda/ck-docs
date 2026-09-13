@@ -1,0 +1,131 @@
+---
+weight: 25
+---
+
+# Logs
+
+The ClickHouse® server writes its own log files to `/var/log/clickhouse-server` inside the server container. This page covers where those files live, how to make them survive a restart, and how to read them.
+
+## Default behaviour: logs are ephemeral
+
+If you do not declare a log volume, the operator mounts an `emptyDir` at the log directory in every container of the pod. Logs are readable while the pod lives and are lost when it is replaced.
+
+For short-lived debugging that is usually enough:
+
+```bash
+kubectl -n <namespace> logs chi-<instance>-<cluster>-0-0-0 -c clickhouse
+kubectl -n <namespace> exec chi-<instance>-<cluster>-0-0-0 -c clickhouse -- \
+  tail -n 200 /var/log/clickhouse-server/clickhouse-server.err.log
+```
+
+## Persisting logs on a volume
+
+Declare a volume claim template and point `logVolumeClaimTemplate` at it:
+
+```yaml
+apiVersion: clickhouse.altinity.com/v1
+kind: ClickHouseInstallation
+metadata:
+  name: e1-logs
+spec:
+  defaults:
+    templates:
+      dataVolumeClaimTemplate: data-volume
+      logVolumeClaimTemplate: log-volume
+      podTemplate: ch-pod
+  configuration:
+    clusters:
+      - name: main
+        layout:
+          shardsCount: 1
+          replicasCount: 1
+  templates:
+    podTemplates:
+      - name: ch-pod
+        spec:
+          securityContext:
+            runAsUser: 101
+            runAsGroup: 101
+            fsGroup: 101
+            runAsNonRoot: true
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: clickhouse
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop:
+                    - ALL
+            - name: clickhouse-log
+              securityContext:
+                runAsUser: 65534
+                runAsNonRoot: true
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop:
+                    - ALL
+                seccompProfile:
+                  type: RuntimeDefault
+    volumeClaimTemplates:
+      - name: data-volume
+        spec:
+          accessModes:
+            - ReadWriteOnce
+          resources:
+            requests:
+              storage: 50Gi
+      - name: log-volume
+        spec:
+          accessModes:
+            - ReadWriteOnce
+          resources:
+            requests:
+              storage: 10Gi
+```
+
+The log volume is mounted at `/var/log/clickhouse-server` in every container of the pod, so a sidecar sees the same files the server writes.
+
+## The `clickhouse-log` container
+
+Setting `logVolumeClaimTemplate` changes the pod's shape. The operator appends a second container named `clickhouse-log` to the pod, whose only job is to stay alive so you can exec into it and read the log volume without disturbing the server. It sleeps in a loop and runs as uid 65534.
+
+That injected container is deliberately minimal, and its security context sets the user id and nothing else. On a namespace enforcing the Pod Security Admission `restricted` profile, that is not enough and the pod is rejected.
+
+The pod template above is the fix, and it is the reason the `clickhouse-log` container is declared there explicitly. If a container with that exact name already exists in your pod template, the operator reuses it instead of appending its own — it only fills in the image when you left it empty or set it to `default`. Declaring the container yourself is therefore the supported way to give it a complete security context.
+
+See [Pod rejected under Pod Security Admission](../trouble_shooting/psa_restricted_admission.mdx) if you have already hit the rejection.
+
+## Reading persisted logs
+
+```bash
+kubectl -n <namespace> exec chi-<instance>-<cluster>-0-0-0 -c clickhouse-log -- \
+  ls -l /var/log/clickhouse-server
+
+kubectl -n <namespace> exec chi-<instance>-<cluster>-0-0-0 -c clickhouse-log -- \
+  tail -n 200 /var/log/clickhouse-server/clickhouse-server.log
+```
+
+## Sizing and rotation
+
+The log volume is a fixed-size PersistentVolumeClaim. A full log volume degrades the server, so size it for your retention and verify that whatever rotation policy you rely on is actually in effect. Log rotation is a server configuration concern and is set through `spec.configuration.settings`, in the same way as any other server setting.
+
+## Query logs
+
+Runtime history — queries, parts, merges, mutations — is in the server's own system tables rather than in text logs. Query them through any client:
+
+```sql
+SELECT event_time, query_duration_ms, read_rows, query
+FROM system.query_log
+WHERE type = 'QueryFinish'
+ORDER BY event_time DESC
+LIMIT 20;
+```
+
+---
+
+ClickHouse is a registered trademark of ClickHouse, Inc. https://clickhouse.com
+
+Alauda is an independent vendor. This product is not affiliated with, endorsed by, or sponsored by ClickHouse, Inc. All trademarks are the property of their respective owners and are used here for identification purposes only.

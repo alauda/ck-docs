@@ -1,0 +1,103 @@
+---
+weight: 4
+---
+
+# Server pods OOMKilled during merges
+
+## Symptom
+
+A server pod that has been running fine is killed and restarted, repeatedly, with no change to the instance. The pod's last state is `OOMKilled` with exit code 137. Server logs before the kill show memory limit exceptions, and the activity at the time is background merging rather than a user query.
+
+Observed with a container memory limit of 1Gi. Sustained restarts eventually surface as `CrashLoopBackOff`.
+
+## Cause
+
+The container memory limit is a hard ceiling on the whole server process, not just on queries. Background merging rewrites parts and needs working memory proportional to the parts being merged, so a limit sized against idle usage or against a light query load is exceeded the first time a large merge runs. The kill happens during merging, which is why it looks unprompted: no client was doing anything unusual.
+
+This is a sizing problem, not a defect. The behaviour is easy to reproduce — the operator's own examples include a deliberately undersized pod template, at 32Mi, whose documented outcome is that the server is killed by the out-of-memory handler and the pod passes through `OOMKilled` into `CrashLoopBackOff`.
+
+## Confirm
+
+```bash
+kubectl -n <namespace> describe pod <pod> | sed -n '/Last State/,/Restart Count/p'
+kubectl -n <namespace> get pod <pod> \
+  -o jsonpath='{range .status.containerStatuses[*]}{.name}{"\t"}{.lastState.terminated.reason}{"\t"}{.lastState.terminated.exitCode}{"\n"}{end}'
+```
+
+`OOMKilled` and `137` confirm the kernel killed the container.
+
+Read the log from the previous instance of the container:
+
+```bash
+kubectl -n <namespace> logs <pod> -c clickhouse --previous | tail -100
+```
+
+Check the configured limit:
+
+```bash
+kubectl -n <namespace> get pod <pod> \
+  -o jsonpath='{range .spec.containers[*]}{.name}{"\t"}{.resources.limits.memory}{"\n"}{end}'
+```
+
+And look at what the server itself was tracking, if it is up long enough to ask:
+
+```sql
+SELECT metric, formatReadableSize(value)
+FROM system.asynchronous_metrics
+WHERE metric LIKE '%Memory%'
+ORDER BY metric;
+
+SELECT database, table, elapsed, formatReadableSize(memory_usage) AS mem, progress
+FROM system.merges
+ORDER BY memory_usage DESC;
+```
+
+## Fix
+
+Raise the container memory limit in the pod template and re-apply:
+
+```yaml
+spec:
+  defaults:
+    templates:
+      podTemplate: ch-pod
+  templates:
+    podTemplates:
+      - name: ch-pod
+        spec:
+          containers:
+            - name: clickhouse
+              resources:
+                requests:
+                  cpu: "2"
+                  memory: 8Gi
+                limits:
+                  cpu: "4"
+                  memory: 16Gi
+```
+
+Guidance:
+
+- **Do not run a production instance at a 1Gi limit.** Size for the largest merge you expect, not for idle usage.
+- **Set the memory request equal to the limit.** This keeps the pod in the guaranteed class and stops the node from overcommitting it into a kill.
+- **Leave headroom above the resident working set.** Merge memory is additional to caches and to whatever queries are running concurrently.
+- **Raise the limit before you grow ingest volume**, not after. Part sizes grow with ingest, and merge memory grows with part sizes.
+
+The change rolls hosts one at a time, so verify the first host recovers before assuming the whole instance is fixed.
+
+## Verify
+
+```bash
+kubectl -n <namespace> get pods -l clickhouse.altinity.com/chi=<instance> \
+  -o custom-columns=NAME:.metadata.name,RESTARTS:.status.containerStatuses[0].restartCount
+```
+
+Watch the restart count over a period that includes real merge activity. A stable count under load is the confirmation; a stable count on an idle instance proves nothing, because merges are what triggered the kill.
+
+Track memory against the limit continuously rather than checking once — see [Monitoring](../functions/35_monitor.mdx).
+
+---
+
+ClickHouse is a registered trademark of ClickHouse, Inc. https://clickhouse.com
+
+Alauda is an independent vendor. This product is not affiliated with, endorsed by, or sponsored by ClickHouse, Inc. All trademarks are the property of their respective owners and are used here for identification purposes only.
