@@ -1,0 +1,168 @@
+---
+weight: 1
+---
+
+# Create an instance
+
+An instance of Alauda Analytical Database E1 is one `ClickHouseInstallation` (CHI) resource. The operator converts it into StatefulSets, Services, ConfigMaps and PersistentVolumeClaims.
+
+## Prerequisites
+
+- The operator is installed and running. It is delivered as an OLM bundle whose package name is `clickhouse-operator`, and the shipped install manifests place it in the `operators` namespace.
+- A StorageClass, if you want persistent data. Without a volume claim template the data directory lives in the pod's writable layer and is lost on restart.
+- A running ZooKeeper-compatible quorum, **only** if you need replication or `ON CLUSTER` DDL. See Configure a replicated cluster.
+
+:::warning
+Do not apply `kustomize-config/samples/sample.yaml` from the operator repository. It hardcodes a namespace, pins a 2021 operand image, and sets a log volume claim template without the matching container security context, so it is rejected on namespaces with Pod Security Admission `restricted`. Use the manifests on this page instead.
+:::
+
+## Minimal instance
+
+One shard, one replica, one 20 GiB data volume:
+
+```yaml
+apiVersion: clickhouse.altinity.com/v1
+kind: ClickHouseInstallation
+metadata:
+  name: e1-demo
+spec:
+  defaults:
+    templates:
+      dataVolumeClaimTemplate: data-volume
+  configuration:
+    clusters:
+      - name: main
+        layout:
+          shardsCount: 1
+          replicasCount: 1
+  templates:
+    volumeClaimTemplates:
+      - name: data-volume
+        spec:
+          accessModes:
+            - ReadWriteOnce
+          resources:
+            requests:
+              storage: 20Gi
+```
+
+Apply it into the namespace where you want the database to run:
+
+```bash
+kubectl -n <namespace> apply -f e1-demo.yaml
+```
+
+Note what is **absent** from that manifest: there is no container image. Leave it out. When a pod template does not name an image, the operator uses the operand image it was configured with at install time, read from the `CK_SERVER_IMAGE` environment variable and prefixed with the registry from `HARBOR`. The operator refuses to start if `CK_SERVER_IMAGE` is empty, and says so by name.
+
+:::warning
+On ACP-delivered installs, leave the `HARBOR` value exactly as the package set it. The platform rewrites operand image references to its own registry at admission, and only for the exact form it expects; changing the registry breaks image pulls, including in air-gapped environments.
+:::
+
+## What the operator creates
+
+For the manifest above, in namespace `<namespace>`:
+
+| Object | Name | Notes |
+| --- | --- | --- |
+| StatefulSet | `chi-e1-demo-main-0-0` | One per host. Always `replicas: 1`. |
+| Pod | `chi-e1-demo-main-0-0-0` | The StatefulSet's single pod. |
+| Service (instance) | `clickhouse-e1-demo` | Ports `http`/8123 and `tcp`/9000. |
+| Service (per host) | `chi-e1-demo-main-0-0` | Headless. |
+| ConfigMap | `chi-e1-demo-common-configd` | Shared server settings, rendered to `config.d`. |
+| ConfigMap | `chi-e1-demo-common-usersd` | Users, profiles, quotas, rendered to `users.d`. |
+| ConfigMap | `chi-e1-demo-deploy-confd-main-0-0` | Per-host settings, rendered to `conf.d`. |
+| PVC | derived from the claim template and host | Mounted at `/var/lib/clickhouse`. |
+| PodDisruptionBudget | per instance | Created at the start of every reconcile. |
+
+A "host" is one shard-replica pair. `shardsCount × replicasCount` gives the number of hosts, and each host is its own StatefulSet holding exactly one pod — the CRD spells this out: "each replica is a separate `StatefulSet` which contains only one `Pod`". Scaling is done by adding hosts, not by raising a StatefulSet's replica count.
+
+## Multi-shard instance
+
+Three shards, no replication, so no ZooKeeper needed:
+
+```yaml
+apiVersion: clickhouse.altinity.com/v1
+kind: ClickHouseInstallation
+metadata:
+  name: e1-sharded
+spec:
+  defaults:
+    templates:
+      dataVolumeClaimTemplate: data-volume
+      podTemplate: ch-pod
+  configuration:
+    clusters:
+      - name: main
+        layout:
+          shardsCount: 3
+          replicasCount: 1
+  templates:
+    podTemplates:
+      - name: ch-pod
+        spec:
+          securityContext:
+            runAsUser: 101
+            runAsGroup: 101
+            fsGroup: 101
+            runAsNonRoot: true
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: clickhouse
+              resources:
+                requests:
+                  cpu: "2"
+                  memory: 8Gi
+                limits:
+                  cpu: "4"
+                  memory: 16Gi
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop:
+                    - ALL
+    volumeClaimTemplates:
+      - name: data-volume
+        spec:
+          accessModes:
+            - ReadWriteOnce
+          resources:
+            requests:
+              storage: 100Gi
+```
+
+The container in a pod template must be named `clickhouse` to be treated as the server container. The uid/gid 101 matches the user the server image is built with.
+
+Give the server a memory limit you have sized. A limit that is too small produces `OOMKilled` and then `CrashLoopBackOff` — the operator repository ships that exact failure as an example, with a 32 MiB limit.
+
+## Useful top-level spec fields
+
+| Field | Effect |
+| --- | --- |
+| `taskID` | Names an update so you can follow it in `status.taskIDsStarted` / `status.taskIDsCompleted`. Random per update if unset. |
+| `stop` | `"1"` sets every StatefulSet to `Replicas: 0`. Pods and the instance Service go away; PVCs are kept. `"0"` brings them back onto the retained PVCs. |
+| `restart` | `"RollingUpdate"` triggers a graceful rolling restart. Remove the field afterwards or you get unwanted restarts on later edits. |
+| `troubleshoot` | `"1"` keeps a pod alive when the server cannot start. |
+| `namespaceDomainPattern` | Custom cluster DNS suffix. Default is `%s.svc.cluster.local`. |
+| `defaults.replicasUseFQDN` | Whether `<host>` entries use FQDNs. `"yes"` by default. |
+| `defaults.storageManagement.reclaimPolicy` | `Delete` (default) or `Retain`. `Retain` keeps PVCs when the StatefulSet is deleted. |
+
+## Verify
+
+Check pods and StatefulSets, not just the resource status:
+
+```bash
+kubectl -n <namespace> get chi e1-demo
+kubectl -n <namespace> get statefulset,pod -l clickhouse.altinity.com/chi=e1-demo
+kubectl -n <namespace> exec chi-e1-demo-main-0-0-0 -c clickhouse -- \
+  clickhouse-client -q "SELECT 1"
+```
+
+The instance is healthy when every StatefulSet reports `ReadyReplicas` equal to its desired replica count — that is precisely the readiness test the operator itself uses. See CHI reports Completed while pods are failing for why the status field alone is not sufficient on older releases.
+
+---
+
+ClickHouse is a registered trademark of ClickHouse, Inc. https://clickhouse.com
+
+Alauda is an independent vendor. This product is not affiliated with, endorsed by, or sponsored by ClickHouse, Inc. All trademarks are the property of their respective owners and are used here for identification purposes only.

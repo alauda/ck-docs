@@ -1,0 +1,84 @@
+---
+weight: 3
+---
+
+# Instance details
+
+This page explains how to read a live instance: how topology maps onto Kubernetes objects, what the status fields mean, and which endpoints exist.
+
+## Topology
+
+```bash
+kubectl -n <namespace> get chi e1-demo -o yaml
+```
+
+Topology is declared under `spec.configuration.clusters[].layout` and derived as follows:
+
+- `shardsCount × replicasCount` = number of **hosts**.
+- Each host is one StatefulSet with `replicas: 1`, holding one pod.
+- Both counts default to `1`, and each is raised automatically if you explicitly enumerate more shards or replicas than the count states.
+
+So a `shardsCount: 3`, `replicasCount: 2` cluster is 6 StatefulSets, 6 pods, 6 PVC sets — not 3 StatefulSets of 2 pods each.
+
+Pod management is `OrderedReady` and the update strategy is `RollingUpdate`.
+
+## Object names
+
+| Object | Pattern |
+| --- | --- |
+| Instance Service | `clickhouse-{chi}` |
+| Cluster Service | `cluster-{chi}-{cluster}` |
+| Shard Service | `shard-{chi}-{cluster}-{shard}` |
+| StatefulSet / host Service | `chi-{chi}-{cluster}-{shard}-{replica}` |
+| Pod | `chi-{chi}-{cluster}-{shard}-{replica}-0` |
+| Common config ConfigMap | `chi-{chi}-common-configd` |
+| Common users ConfigMap | `chi-{chi}-common-usersd` |
+| Host config ConfigMap | `chi-{chi}-deploy-confd-{cluster}-{shard}-{replica}` |
+
+:::note
+The cluster and shard Services are *named* by the patterns above but are **not created by default**. The operator returns no object for either unless you set a `clusterServiceTemplate` or `shardServiceTemplate`. Out of the box you get exactly two kinds of Service: one per instance, and one per host.
+:::
+
+## Endpoints
+
+| Port | Name | Purpose |
+| --- | --- | --- |
+| 8123 | `http` | HTTP interface, and what the operator itself uses for queries. |
+| 9000 | `tcp` | Native protocol, used by `clickhouse-client`. |
+| 9009 | `interserver` | Replica-to-replica traffic. Not for clients. |
+
+`status.endpoint` carries the instance-wide address, and `status.fqdns` lists per-host addresses. See Access the instance for how to reach them and what the default Service type is.
+
+## Status fields
+
+```bash
+kubectl -n <namespace> get chi e1-demo -o jsonpath='{.status}' | jq
+```
+
+| Field | Meaning |
+| --- | --- |
+| `status` | `InProgress`, `Completed`, or `Terminating`. |
+| `clusters`, `shards`, `replicas`, `hosts` | Counts of the reconciled topology. |
+| `pods`, `pod-ips`, `fqdns` | Per-host pod names, pod IPs, and hostnames. |
+| `endpoint` | Address of the instance-wide Service. |
+| `action`, `actions` | Most recent reconcile action, and a bounded history. |
+| `error`, `errors` | Most recent error, and a bounded history. |
+| `taskID`, `taskIDsStarted`, `taskIDsCompleted` | Update tracking, matching `spec.taskID`. |
+| `updated`, `added`, `deleted`, `delete` | Objects touched by the last reconcile. |
+| `chop-version`, `chop-commit`, `chop-date`, `chop-ip` | Which operator build and pod reconciled this instance. |
+| `normalized`, `normalizedCompleted` | The spec after defaulting and template merging — useful for seeing what the operator actually acted on. |
+
+`status.normalized` is the most useful field when a setting appears not to have taken effect: it shows the merged result of your spec, any templates it used, and the operator's defaults.
+
+## Health
+
+`status.status: Completed` means the operator finished its reconcile pass. On release 4.4 that pass will not complete until every host's StatefulSet is ready, and the status is demoted back to `InProgress` if a host degrades afterwards.
+
+Confirm health against the workload itself:
+
+```bash
+kubectl -n <namespace> get statefulset -l clickhouse.altinity.com/chi=e1-demo \
+  -o custom-columns=NAME:.metadata.name,DESIRED:.spec.replicas,READY:.status.readyReplicas
+```
+
+Every row must show `READY` equal to `DESIRED`. That is the operator's own definition of a ready host.

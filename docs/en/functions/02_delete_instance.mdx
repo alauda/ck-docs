@@ -1,0 +1,87 @@
+---
+weight: 2
+---
+
+# Delete an instance
+
+Deleting a `ClickHouseInstallation` removes the workload. Whether it removes your **data** depends on the reclaim policy you set when you created it. Read the reclaim section before you delete anything you care about.
+
+## Stop instead of delete
+
+If you only want to release compute, stop the instance rather than deleting it:
+
+```bash
+kubectl -n <namespace> patch chi e1-demo --type=merge -p '{"spec":{"stop":"1"}}'
+```
+
+This sets `Replicas: 0` on every StatefulSet. Pods and the instance Service are removed; PVCs are retained. Setting `stop` back to `"0"` recreates the pods, which reattach the retained volumes.
+
+## Delete
+
+```bash
+kubectl -n <namespace> delete chi e1-demo
+```
+
+The resource does not disappear immediately. The operator installs a finalizer, `finalizer.clickhouseinstallation.altinity.com`, on every instance it manages. The API server therefore marks the object for deletion and waits; the operator runs its teardown and only then removes the finalizer, which lets the object go.
+
+While teardown is in progress the status reports `Terminating`.
+
+## Deletion order
+
+The operator tears the instance down in a fixed order:
+
+1. Delete the PodDisruptionBudget.
+2. Stop monitoring the instance, so the metrics exporter drops it.
+3. Delete the instance-wide Service.
+4. Ask each host to sync its tables, so replicated data in flight is flushed before the pod goes away.
+5. Delete each cluster, which walks down to each host and deletes, in order, the StatefulSet, the PVCs, the host ConfigMap and the host Service.
+6. Delete the instance-wide ConfigMaps.
+7. Remove the finalizer.
+
+StatefulSets are removed gracefully — the operator scales them to zero first rather than deleting them outright.
+
+## Whether your volumes survive
+
+Volumes are deleted by default. For each PVC, the operator resolves the reclaim policy of the volume claim template that produced it. It deletes the PVC when that policy is `Delete`, and it treats an unresolvable or untemplated PVC as `Delete` as well.
+
+To keep data across an instance deletion, set the policy to `Retain` before you delete:
+
+```yaml
+spec:
+  defaults:
+    storageManagement:
+      reclaimPolicy: Retain
+```
+
+The enum accepts `""`, `Retain` and `Delete`, and the CRD describes `Retain` as keeping the PVC when the StatefulSet is deleted. The policy can also be set per volume claim template, which is how you keep a data volume while letting a log volume go.
+
+:::warning
+Changing `reclaimPolicy` after you have issued the delete is too late. Set it, confirm it is present on the live object, and only then delete.
+:::
+
+## Verify the teardown
+
+```bash
+kubectl -n <namespace> get chi
+kubectl -n <namespace> get statefulset,pod,svc,cm -l clickhouse.altinity.com/chi=e1-demo
+kubectl -n <namespace> get pvc
+```
+
+The PVC listing is the one that matters. If you intended `Retain` and the claims are gone, the policy was not in effect.
+
+## If the resource will not go away
+
+A `ClickHouseInstallation` stuck in `Terminating` almost always means the operator is not running, or is not watching that namespace, and so nobody is removing the finalizer. Check the operator pod first:
+
+```bash
+kubectl -n operators get pods -l app=clickhouse-operator
+kubectl -n operators logs deploy/clickhouse-operator -c clickhouse-operator
+```
+
+Namespace scoping comes from the operator configuration key `watch.namespaces`; an empty list means all namespaces.
+
+---
+
+ClickHouse is a registered trademark of ClickHouse, Inc. https://clickhouse.com
+
+Alauda is an independent vendor. This product is not affiliated with, endorsed by, or sponsored by ClickHouse, Inc. All trademarks are the property of their respective owners and are used here for identification purposes only.
