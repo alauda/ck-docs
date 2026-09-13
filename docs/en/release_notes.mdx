@@ -23,6 +23,10 @@ i18n:
 - **Instance status now reflects pod readiness.** An instance is marked `Completed` only when every host's StatefulSet reports its desired replicas as ready, and it returns to `InProgress` if a host later loses readiness. After upgrading, an instance whose pods are unhealthy reports `InProgress` where earlier releases reported `Completed`. See [Instance reports Completed while pods are unhealthy](trouble_shooting/status_completed_but_pods_unhealthy.mdx).
 - **The operator requires a server image to be configured.** The operator no longer falls back to a built-in server image reference when none is configured; it reports a configuration error at startup instead. Installations from the plugin package always configure the image, so they are not affected.
 
+### Upgrade Notes
+
+- **Upgrading the operator restarts ClickHouse pods.** The new operator changes the default server image and the shared logger configuration, so every instance that does not specify its own server image is updated with a rolling restart, one replica at a time. Instances with a single replica are unavailable while their pod restarts. Plan the operator upgrade for a maintenance window if you run single-replica instances.
+
 ### Fixed Issues
 
 - **ClickHouse could not start as a non-root user.** The default logger configuration pointed the error log at `/dev/null`. The server derives its log directory from that path and tried to manage `/dev`, which fails without root privileges, so an instance whose pods run as a non-root user — including any instance in a namespace that enforces the Pod Security Admission `restricted` profile — never started. The error log is now written to `/var/log/clickhouse-server/clickhouse-server.err.log`.
