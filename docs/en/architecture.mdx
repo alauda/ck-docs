@@ -1,0 +1,35 @@
+---
+weight: 2
+---
+
+# Architecture
+
+Alauda Analytical Database E1 is a single-Deployment operator that turns a
+`ClickHouseInstallation` (CHI) into a set of standard Kubernetes workload objects.
+Nothing in the data path is custom: every ClickHouse® server instance is an ordinary
+Pod inside an ordinary StatefulSet.
+
+## The operator Deployment
+
+One Deployment named `clickhouse-operator` in namespace `operators`, `replicas: 1`,
+with two containers:
+
+| Container | Binary | Role |
+|---|---|---|
+| `clickhouse-operator` | `cmd/operator` | Watches the three CRDs and reconciles Kubernetes objects |
+| `metrics-exporter` | `cmd/metrics_exporter` | Scrapes each ClickHouse® host and re-exposes Prometheus metrics |
+
+Pod and Service selector is the bare label `app=clickhouse-operator`,
+**not** `app.kubernetes.io/name`.
+
+Which namespaces the operator reconciles is decided by its OperatorGroup at install time, through the
+`WATCH_NAMESPACE` environment variable. Installed for all namespaces, it reconciles a
+`ClickHouseInstallation` wherever it is created. Installed into a single namespace, it reconciles only
+that namespace — a `ClickHouseInstallation` created anywhere else is **silently ignored**: no error, no
+events, no status. If a new cluster never progresses, check the install mode before anything else.
+
+Five ConfigMaps are mounted under `/etc/clickhouse-operator` (`files`, `conf.d`,
+`config.d`, `templates.d`, `users.d`) and supply the operator's own configuration and
+the baseline ClickHouse® config fragments.
+
+## Object graph

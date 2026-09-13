@@ -1,0 +1,71 @@
+---
+weight: 1
+---
+
+# Introduction
+
+Alauda Analytical Database E1 is an enterprise-grade real-time analytical database
+service built on the open-source ClickHouse®. It provides cloud-native deployment,
+operations, and full cluster lifecycle management on Kubernetes.
+
+## What it is
+
+A column-oriented OLAP engine for real-time queries and analytics over large
+datasets, delivered as a Kubernetes operator. You declare the desired cluster
+topology in a custom resource; the operator renders and reconciles the StatefulSets,
+Services, ConfigMaps and PersistentVolumeClaims that implement it.
+
+Three custom resources, all in group `clickhouse.altinity.com/v1` and all namespaced:
+
+| Kind | Short name | Purpose |
+|---|---|---|
+| `ClickHouseInstallation` | `chi` | One database cluster: its topology, settings and users |
+| `ClickHouseInstallationTemplate` | `chit` | Reusable fragments merged into a CHI |
+| `ClickHouseOperatorConfiguration` | `chopconf` | Operator-wide behaviour |
+
+The operator is delivered as an OLM bundle. The OLM package name is
+`clickhouse-operator` and it installs into the
+`operators` namespace.
+Both `amd64` and `arm64` are declared supported.
+
+## Sharding and replication
+
+A cluster is a grid of shards and replicas, declared as
+`spec.configuration.clusters[].layout.shardsCount` and `.replicasCount`. A shard holds a
+shared-nothing part of the data; a replica is a full copy of one shard. Each
+shard/replica pair — a *host* — is its own StatefulSet carrying exactly one Pod.
+
+Replication itself is performed by the engine, not the operator. `*ReplicatedMergeTree`
+table engines and `distributed_ddl` coordinate through a ZooKeeper-compatible
+ensemble, which the cluster reaches via `spec.configuration.zookeeper.nodes`. The operator writes that
+address into each Pod's generated `<zookeeper>` configuration and propagates schema to
+newly added hosts.
+
+## What it is not
+
+- **Not an OLTP database.** It is built for read-heavy analytical scanning and
+  aggregation over large datasets, not for transactional workloads.
+- **No backup or restore API.** None of the three custom resources provides backup or restore.
+  Data protection must be arranged outside the operator.
+- **The coordination service is not managed for you.** The CRD states plainly that
+  the operator "doesn't manage Zookeeper". You must provide a running
+  ZooKeeper-compatible ensemble and point the CR at it. There is no
+  `ClickHouseKeeperInstallation` CRD in this distribution — the shipped bundle owns
+  exactly the three CRDs listed above.
+
+## Versions
+
+| Component | Value |
+|---|---|
+| Operand image | `middleware/clickhouse-server:v25.8.33.6-3eaa0395` |
+| ClickHouse® engine | `25.8.33.6` |
+| OLM package | `clickhouse-operator` |
+
+---
+
+ClickHouse® is a registered trademark of ClickHouse, Inc. Any use by Alauda is for
+referential purposes only and does not indicate any sponsorship, endorsement or
+affiliation between ClickHouse, Inc. and Alauda. Alauda is an independent vendor.
+This product is not affiliated with, endorsed by, or sponsored by ClickHouse, Inc.
+All trademarks are the property of their respective owners and are used here for
+identification purposes only.

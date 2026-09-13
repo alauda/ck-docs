@@ -1,0 +1,3 @@
+clickhouseinstallations
+clickhouseinstallationtemplates
+clickhouseoperatorconfigurations

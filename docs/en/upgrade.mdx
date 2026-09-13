@@ -1,0 +1,21 @@
+---
+weight: 4
+---
+
+# Upgrade
+
+There are two independent upgrades, and they are not the same operation:
+
+- **The operator** is upgraded by OLM, which replaces the operator's ClusterServiceVersion. This
+  does not restart your database pods.
+- **The operand** — the ClickHouse® engine running in your clusters — is upgraded by changing the
+  `ClickHouseInstallation` resource. This does restart database pods, one replica at a time.
+
+Upgrade the operator first. A newer operator is expected to manage an older operand; the reverse
+is not.
+
+## Upgrade the operator
+
+If the `Subscription` was created with `installPlanApproval: Automatic`, OLM upgrades the operator
+as soon as a newer version appears in the `stable` channel. With `Manual`, an `InstallPlan` is
+created and waits for approval:

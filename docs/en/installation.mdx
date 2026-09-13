@@ -1,0 +1,31 @@
+---
+weight: 3
+---
+
+# Installation
+
+Alauda Analytical Database E1 is delivered as an OLM operator package. Installing it is two
+separate steps: install the operator, then create a database cluster as a custom resource.
+
+## Prerequisites
+
+- An Alauda Container Platform cluster with OLM available, and permission to create a
+  `Subscription` in the `operators` namespace.
+- A default `StorageClass`, or a named `StorageClass` you will reference from the cluster
+  manifest. Each replica claims at least one persistent volume for data, and a second one if you
+  enable log persistence.
+- A ZooKeeper™ ensemble reachable from the cluster namespace, required for replicated tables.
+  Use three nodes or more. A cluster with replication configured but no reachable ensemble will
+  start and then fail to replicate.
+- Sufficient quota for the topology you intend to create: one pod and one data volume per
+  replica, so a two-shard, two-replica cluster is four pods.
+
+## Install the operator
+
+The package name is `clickhouse-operator`, the channel is `stable`, and the install namespace is
+`operators`.
+
+From the ACP marketplace, select the Alauda Analytical Database E1 operator and install it into
+`operators` on the `stable` channel.
+
+Equivalently, by manifest:
