@@ -14,7 +14,7 @@ This page states the release and maintenance scope of **Alauda Data Services Ana
 
 | Release | Upstream engine | Bundle version | Stage | Architectures |
 | --- | --- | --- | --- | --- |
-| 4.4 | ClickHouse® 25.8.33.6 (25.8 LTS series) | `v4.4.0-rc.1.g41762d5b` | Release candidate | amd64, arm64 |
+| 4.4 | ClickHouse® 25.8.33.6 (25.8 LTS series) | `v4.4.0-rc.2.g414f933f` | Release candidate | amd64, arm64 |
 
 The 4.4 build is a release candidate. It has not reached GA, so no support window has started for it.
 
@@ -22,15 +22,15 @@ Images shipped with the 4.4 bundle:
 
 | Component | Image |
 | --- | --- |
-| Operator | `middleware/clickhouse-operator:v4.4.0-rc.1.g41762d5b` |
+| Operator | `middleware/clickhouse-operator:v4.4.0-rc.2.g414f933f` |
 | Server | `middleware/clickhouse-server:v25.8.33.6-3eaa0395` |
-| Metrics exporter | `middleware/clickhouse-exporter:v4.4.0-rc.1.g41762d5b` |
+| Metrics exporter | `middleware/clickhouse-exporter:v4.4.0-rc.2.g414f933f` |
 
 ## Release policy
 
-Support windows for S3 components are governed by section 9.3 of `ecosystem-oss-lifecycle-policy`, which is the authoritative source. Under that policy, each S3 release moves from Full Support to Maintenance 18 months from its GA date.
+Support windows are governed by the Alauda lifecycle policy for this product line, which is the authoritative source. Under that policy, each GA release moves from Full Support to Maintenance 18 months after its GA date.
 
-This page points to that policy and does not reproduce it. Where this page and section 9.3 differ, section 9.3 governs.
+This page summarizes that policy and does not replace it. Where this page and the policy differ, the policy governs.
 
 Alauda Data Services Analytical Database E1 is not a designated long-life release.
 
@@ -39,8 +39,8 @@ Alauda Data Services Analytical Database E1 is not a designated long-life releas
 While a release is under Full Support, Alauda provides:
 
 - **Engine anchoring.** The product tracks the ClickHouse 25.8 LTS series.
-- **Alauda-built images.** The operator, server, and metrics-exporter images are built by Alauda from Alauda-maintained sources, for amd64 and arm64.
-- **Fixes through new releases.** Corrections, including security fixes, reach customers as a new product release built against an updated engine patch version.
+- **Alauda-built images.** Alauda compiles the operator and metrics-exporter images from Alauda-maintained source, and packages the server image from ClickHouse engine release packages. All images are published for amd64 and arm64.
+- **Fixes through new releases.** Corrections, including security fixes, reach customers in a new product release.
 
 ## Not included
 
