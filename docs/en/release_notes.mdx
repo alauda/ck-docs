@@ -35,6 +35,7 @@ i18n:
 ### Known Issues
 
 - **Instances that set `logVolumeClaimTemplate` are rejected under the Pod Security Admission `restricted` profile unless you define the log container yourself.** The operator adds a `clickhouse-log` container whose security context sets only a user ID. Define a container named `clickhouse-log` with a compliant security context in your pod template. See [Pod rejected under Pod Security Admission](trouble_shooting/psa_restricted_admission.mdx).
+- **Instances with a memory limit below 2 GiB can reject small queries.** ClickHouse caps its own memory use at 90% of the container memory limit, and an idle server's resident memory can approach 1 GiB. With a 1 GiB limit, the server can exceed its cap while idle and fail even trivial queries with `Code: 241 … (total) memory limit exceeded`. Set `resources.limits.memory` of the `clickhouse` container to at least `2Gi`. This also affects earlier releases.
 
 ---
 
