@@ -13,14 +13,14 @@ i18n:
 
 - **New product name.** The plugin is now listed as **Alauda Data Services Analytical Database E1**. The change is to display names only: the package name, the custom resource kinds and API group, and existing instances are unchanged.
 - **ClickHouse® engine 25.8.33.6.** The default server image moves from 25.8.16.34 to 25.8.33.6, a patch release on the same 25.8 LTS line. New instances use it by default; existing instances keep the image they specify until you change it, as described in [Upgrade](upgrade.mdx).
-- **Rebuilt images.** The operator and metrics exporter are compiled with an updated Go toolchain on an updated Alpine base, and the busybox helper image is pinned to a fixed tag instead of a floating one.
+- **Rebuilt images.** The operator and metrics exporter are compiled with an updated Go toolchain on an updated Alpine base, and the busybox helper image is pinned to a fixed tag instead of a floating one. The ClickHouse server image includes the GNU C Library security updates published for its base up to `2.31-0ubuntu9.18`, on both amd64 and arm64.
 - **Image provenance.** The operator, metrics exporter, and bundle images carry `org.opencontainers.image.source`, `org.opencontainers.image.revision`, and `org.opencontainers.image.ref.name` labels identifying the source they were built from.
 - **Memory-aware operator runtime.** The operator and metrics exporter set the Go runtime's soft memory limit from their container memory limit, which reduces the risk of the operator being OOM-killed on large installations.
 - **Licence notices.** Files modified from the upstream project carry modification notices, and the licence text is included in the operator bundle.
 
 ### Behaviour Changes
 
-- **Instance status now reflects pod readiness.** An instance is marked `Completed` only when every host's StatefulSet reports its desired replicas as ready, and it returns to `InProgress` if a host later loses readiness. After upgrading, an instance whose pods are unhealthy reports `InProgress` where earlier releases reported `Completed`. See [Instance reports Completed while pods are unhealthy](trouble_shooting/status_completed_but_pods_unhealthy.mdx).
+- **Instance status now reflects pod readiness.** An instance is marked `Completed` only when every host's StatefulSet reports its desired replicas as ready, and it returns to `InProgress` if a host later loses readiness. When the pods become ready again, the instance moves back to `Completed` on its own; you do not need to change the instance to clear the status. After upgrading, an instance whose pods are unhealthy reports `InProgress` where earlier releases reported `Completed`. See [Instance reports Completed while pods are unhealthy](trouble_shooting/status_completed_but_pods_unhealthy.mdx).
 - **The operator requires a server image to be configured.** The operator no longer falls back to a built-in server image reference when none is configured; it reports a configuration error at startup instead. Installations from the plugin package always configure the image, so they are not affected.
 
 ### Upgrade Notes
