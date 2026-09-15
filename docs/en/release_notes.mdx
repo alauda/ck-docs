@@ -16,7 +16,7 @@ i18n:
 - **Rebuilt images.** The operator and metrics exporter are compiled with an updated Go toolchain on an updated Alpine base, and the busybox helper image is pinned to a fixed tag instead of a floating one. The ClickHouse server image includes the GNU C Library security updates published for its base up to `2.31-0ubuntu9.18`, on both amd64 and arm64.
 - **Image provenance.** The operator, metrics exporter, and bundle images carry `org.opencontainers.image.source`, `org.opencontainers.image.revision`, and `org.opencontainers.image.ref.name` labels identifying the source they were built from.
 - **Memory-aware operator runtime.** The operator and metrics exporter set the Go runtime's soft memory limit from their container memory limit, which reduces the risk of the operator being OOM-killed on large installations.
-- **Licence notices.** Files modified from the upstream project carry modification notices, and the licence text is included in the operator bundle.
+- **Licence notices.** Files modified from the upstream project carry modification notices, and the licence text is included in the operator, metrics exporter, and server images.
 
 ### Behaviour Changes
 
