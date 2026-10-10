@@ -12,6 +12,10 @@ The operator does not deploy or manage a coordination quorum, and the product sh
 
 Three members is the smallest quorum with fault tolerance: a majority of three is two, so the quorum survives the loss of one member and stops serving at one survivor. This is the layout the product's own replication tests run.
 
+:::info
+There is a second supported shape: Keeper running inside the ClickHouse pods themselves, so a 1 shard x 3 replica instance is its own three-member quorum. It is documented in the knowledge base as [How to Deploy a Replicated ClickHouse Cluster with Embedded ClickHouse Keeper](https://docs.alauda.io/knowledge/en/solutions/ecosystem/clickhouse/How_to_Deploy_a_Replicated_ClickHouse_Cluster_with_Embedded_ClickHouse_Keeper.html) (KB260600102). Choose it when you want a single workload and accept that Keeper shares the pods' resources and restarts with them. This page keeps the quorum separate so it can be sized, placed and rolled independently of the database, and so several instances can share it.
+:::
+
 ## Prerequisites
 
 - The operator is installed. Its Deployment is where you read the server image from.
