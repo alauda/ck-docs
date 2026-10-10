@@ -138,13 +138,20 @@ spec:
     clusters:
       - name: main
         secret:
-          auto: "yes"
+          valueFrom:
+            secretKeyRef:
+              name: main-cluster-secret
+              key: secret
         layout:
           shardsCount: 2
           replicasCount: 2
 ```
 
-`auto: "yes"` makes the operator generate the value and store it in a Secret it manages. Alternatively supply `value` in plain text, or `valueFrom.secretKeyRef` pointing at a Secret in the same namespace as the instance. Prefer `auto` or `secretKeyRef`; `value` puts the secret into the instance manifest.
+Create the Secret before the instance, in the same namespace, with any random value under the named key. The alternatives are `value`, which puts the secret into the instance manifest in plain text, and `auto: "yes"`, which asks the operator to generate and store the value itself.
+
+:::warning
+Do not use `auto: "yes"` on ACP. The operator's role grants only `get` and `list` on Secrets, so it cannot create the generated Secret; the pods then wait forever in `CreateContainerConfigError` with `secret "<instance>-<cluster>-auto-secret" not found`. Use `secretKeyRef`.
+:::
 
 ## Files
 

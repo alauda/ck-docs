@@ -28,11 +28,21 @@ These are the ACP baseline defaults. If you change one, change it in the logging
 - A three-member Keeper quorum, built as described in [Deploy a Keeper quorum](./deploy_keeper_quorum.mdx), in `cpaas-system`. Replication cannot start without it.
 - Three infra nodes (label and taint `node-role.kubernetes.io/infra`), each able to hold one Keeper member and one ClickHouse replica.
 - A StorageClass for the data volumes. Size them from the logging capacity planning guide, not from the example below.
+- Free **requestable** capacity on the three nodes for the pod sizes you choose. Judge it from the "Allocated resources" section of `kubectl describe node`, not from `kubectl top`: on ACP the storage components (for example rook-ceph) reserve most of a small worker's requests while using little of it, and a pod that does not fit the remaining requests stays `Pending` with `Insufficient memory`.
 - Passwords for two accounts: an administrator you will use for one-time DDL, and `platform-logging`. Hash them once:
 
   ```bash
   printf '%s' '<password>' | sha256sum | cut -d' ' -f1
   ```
+
+## The cluster secret
+
+Replica-to-replica traffic inside the cluster is authenticated with a shared secret. Create it yourself before the instance; the operator installed on ACP cannot create Secrets, so the `secret: auto` form must not be used:
+
+```bash
+kubectl -n cpaas-system create secret generic cpaas-clickhouse-cluster-secret \
+  --from-literal=secret="$(openssl rand -hex 24)"
+```
 
 ## The instance
 
@@ -59,7 +69,10 @@ spec:
     clusters:
       - name: replicated
         secret:
-          auto: "yes"
+          valueFrom:
+            secretKeyRef:
+              name: cpaas-clickhouse-cluster-secret
+              key: secret
         layout:
           shardsCount: 1
           replicasCount: 3
@@ -140,8 +153,8 @@ What the pieces do:
 - **`serviceTemplate: internal`** makes the instance-wide Service a ClusterIP. The default is a LoadBalancer, which stays without an address on clusters that have no provider, and the logging stack only ever connects from inside the cluster.
 - **`ShardAntiAffinity`** keeps the three replicas of the one shard on three different nodes; together with the node affinity, that is one replica per infra node.
 - **`networks/ip: "::/0"`** lets the logging pods, which run in other pods of the same namespace, reach the account. The operator's default allow-list is loopback only, so without this line every connection from the data path is refused. Narrow it to your pod CIDR if your policy requires it.
-- **`grants/query`** declares the account's privileges in the users configuration, so they exist on every replica without a `GRANT` statement. `CLUSTER` is needed because the logging schema migrations use `ON CLUSTER`.
-- **`secret: auto`** authenticates replica-to-replica traffic with an operator-generated secret.
+- **`grants/query`** declares the account's privileges in the users configuration, so they exist on every replica without a `GRANT` statement. `CLUSTER` is needed because the logging schema migrations use `ON CLUSTER`. Note that `ALL ON observability.*` is broad: it also covers user, role and row-policy management scoped to that database. Narrow it to `SELECT, INSERT, CREATE, ALTER, DROP ON observability.*` if least privilege matters more than simplicity.
+- **`secret.valueFrom.secretKeyRef`** authenticates replica-to-replica traffic with the Secret you created above. Do not use `secret: auto`: the operator's role allows it only to read Secrets, so the generated Secret never appears and every pod stays in `CreateContainerConfigError`.
 - There is no container image. The operator supplies the operand image it was installed with.
 
 Apply and wait for the three hosts:
