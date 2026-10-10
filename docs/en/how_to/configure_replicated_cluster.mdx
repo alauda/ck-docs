@@ -15,7 +15,7 @@ About Keeper specifically:
 - The delivered server image's `clickhouse` binary is multi-call and includes a `keeper` subcommand, so the coordination service is part of the same binary that runs the server. There is no separate coordination image in this product.
 - There is no custom resource representing a coordination quorum, and nothing in the operator reconciles one. If you choose to run a quorum from the same image, you own its workload, its storage and its configuration, exactly as you would for any other stateful service.
 
-Whichever quorum you use, the instance only ever learns about it as a list of host addresses.
+Whichever quorum you use, the instance only ever learns about it as a list of host addresses. If you do not have one yet, [Deploy a Keeper quorum](./deploy_keeper_quorum.mdx) builds a three-member quorum from the shipped server image under exactly the names used below.
 
 ## The instance
 
