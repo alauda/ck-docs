@@ -14,9 +14,10 @@ separate steps: install the operator, then create a database cluster as a custom
 - A default `StorageClass`, or a named `StorageClass` you will reference from the cluster
   manifest. Each replica claims at least one persistent volume for data, and a second one if you
   enable log persistence.
-- A ZooKeeper™ ensemble reachable from the cluster namespace, required for replicated tables.
-  Use three nodes or more. A cluster with replication configured but no reachable ensemble will
-  start and then fail to replicate.
+- A ZooKeeper-compatible coordination quorum reachable from the cluster namespace, required for
+  replicated tables. Use three members or more. A cluster with replication configured but no
+  reachable quorum will start and then fail to replicate. The product ships no quorum of its own;
+  [Deploy a Keeper quorum](./how_to/deploy_keeper_quorum.mdx) builds one from the server image.
 - Sufficient quota for the topology you intend to create: one pod and one data volume per
   replica, so a two-shard, two-replica cluster is four pods.
 
