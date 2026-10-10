@@ -1,0 +1,260 @@
+---
+weight: 3
+---
+
+# Deploy a Keeper quorum
+
+This page runs a three-member ClickHouse Keeper quorum on dedicated infra nodes, using only the server image that this product ships. The result is the quorum that [Configure a replicated cluster](./configure_replicated_cluster.mdx) assumes, reachable as `keeper-0.keeper-headless.<quorum-namespace>` and so on, so the instance manifest on that page works unchanged.
+
+## What you are building
+
+The operator does not deploy or manage a coordination quorum, and the product ships no separate Keeper image. It does not need one: the `clickhouse` binary in the delivered server image is multi-call and includes `clickhouse-keeper`. A quorum is therefore an ordinary StatefulSet that you own, built from an image that is already in your registry. In an air-gapped installation nothing extra has to be mirrored.
+
+Three members is the smallest quorum with fault tolerance: a majority of three is two, so the quorum survives the loss of one member and stops serving at one survivor. This is the layout the product's own replication tests run.
+
+## Prerequisites
+
+- The operator is installed. Its Deployment is where you read the server image from.
+- Three nodes for the members. On ACP these are normally the infra nodes, labelled `node-role.kubernetes.io/infra` and tainted with the same key. The manifest below tolerates that taint and requires the label; with fewer than three such nodes, remove the anti-affinity block and accept that two members on one node share its failure.
+- A StorageClass. Coordination logs and snapshots are small; 10 GiB per member is ample.
+- A namespace for the quorum. The instance namespace is the simplest choice. A separate namespace also works; the instance then uses fully qualified addresses.
+
+## Resolve the server image
+
+Read the image the operator gives to instance pods rather than writing one by hand. The registry comes from the operator's own image reference and the repository and tag from the `CK_SERVER_IMAGE` variable on the same container:
+
+```bash
+OP=$(kubectl -n operators get deploy clickhouse-operator \
+  -o jsonpath='{.spec.template.spec.containers[?(@.name=="clickhouse-operator")].image}')
+TAG=$(kubectl -n operators get deploy clickhouse-operator \
+  -o jsonpath='{.spec.template.spec.containers[?(@.name=="clickhouse-operator")].env[?(@.name=="CK_SERVER_IMAGE")].value}')
+echo "${OP%%/*}/${TAG}"
+```
+
+Put the printed value in the `image` field below. Use the same value every time the operand image changes.
+
+## The manifest
+
+Save as `keeper.yaml` after replacing `<quorum-namespace>`, `<server-image>` and, if you do not want the default StorageClass, `<storage-class>`.
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: keeper
+  namespace: <quorum-namespace>
+  labels:
+    app: keeper
+data:
+  keeper_config.xml: |
+    <clickhouse>
+        <logger><level>information</level><console>1</console></logger>
+        <listen_host>0.0.0.0</listen_host>
+        <max_connections>256</max_connections>
+        <keeper_server>
+            <tcp_port>2181</tcp_port>
+            <!-- rewritten from the pod ordinal at start-up; see the container command -->
+            <server_id>__SERVER_ID__</server_id>
+            <log_storage_path>/var/lib/clickhouse-keeper/coordination/log</log_storage_path>
+            <snapshot_storage_path>/var/lib/clickhouse-keeper/coordination/snapshots</snapshot_storage_path>
+            <coordination_settings>
+                <operation_timeout_ms>10000</operation_timeout_ms>
+                <session_timeout_ms>30000</session_timeout_ms>
+                <raft_logs_level>information</raft_logs_level>
+            </coordination_settings>
+            <raft_configuration>
+                <server><id>1</id><hostname>keeper-0.keeper-headless</hostname><port>9234</port></server>
+                <server><id>2</id><hostname>keeper-1.keeper-headless</hostname><port>9234</port></server>
+                <server><id>3</id><hostname>keeper-2.keeper-headless</hostname><port>9234</port></server>
+            </raft_configuration>
+        </keeper_server>
+    </clickhouse>
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: keeper-headless
+  namespace: <quorum-namespace>
+  labels:
+    app: keeper
+spec:
+  clusterIP: None
+  # Required. Members must resolve each other before any of them is Ready,
+  # otherwise the quorum never forms.
+  publishNotReadyAddresses: true
+  selector:
+    app: keeper
+  ports:
+    - name: client
+      port: 2181
+    - name: raft
+      port: 9234
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: keeper
+  namespace: <quorum-namespace>
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: keeper
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: keeper
+  namespace: <quorum-namespace>
+  labels:
+    app: keeper
+spec:
+  serviceName: keeper-headless
+  replicas: 3
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app: keeper
+  template:
+    metadata:
+      labels:
+        app: keeper
+    spec:
+      tolerations:
+        - key: node-role.kubernetes.io/infra
+          operator: Exists
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: node-role.kubernetes.io/infra
+                    operator: Exists
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels:
+                  app: keeper
+      securityContext:
+        fsGroup: 101
+      containers:
+        - name: keeper
+          image: <server-image>
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/sh
+            - -c
+            - >-
+              ORD=${HOSTNAME##*-};
+              sed "s/__SERVER_ID__/$((ORD+1))/" /etc/keeper-tpl/keeper_config.xml
+              > /var/lib/clickhouse-keeper/keeper_config.xml;
+              exec clickhouse-keeper --config-file=/var/lib/clickhouse-keeper/keeper_config.xml
+          ports:
+            - name: client
+              containerPort: 2181
+            - name: raft
+              containerPort: 9234
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 101
+            runAsGroup: 101
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          resources:
+            requests:
+              cpu: 500m
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+          readinessProbe:
+            tcpSocket:
+              port: 2181
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 30
+          volumeMounts:
+            - name: config
+              mountPath: /etc/keeper-tpl
+            - name: data
+              mountPath: /var/lib/clickhouse-keeper
+      volumes:
+        - name: config
+          configMap:
+            name: keeper
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        # storageClassName: <storage-class>
+        resources:
+          requests:
+            storage: 10Gi
+```
+
+Points worth knowing before you change anything:
+
+- **`server_id` comes from the pod ordinal.** Every member needs a different id, but a StatefulSet gives all pods the same ConfigMap. The container copies the template into its data volume with the placeholder replaced, then starts from that copy. ConfigMap mounts are read-only, so the copy is not optional.
+- **Raft addresses are the short pod names.** `keeper-0.keeper-headless` resolves inside the quorum's own namespace through the pod's DNS search list, so the ConfigMap carries no namespace. Instances in other namespaces address the members by their fully qualified names.
+- **The security context is the `restricted` Pod Security profile.** uid and gid 101 are the `clickhouse` user baked into the image; `fsGroup` makes the volume writable by it.
+- **The readiness probe is a TCP check only.** A member that has lost quorum still accepts connections, so readiness tells you the process is listening, not that the quorum is serving. Use `mntr` below for that.
+
+Apply it:
+
+```bash
+kubectl -n <quorum-namespace> apply -f keeper.yaml
+kubectl -n <quorum-namespace> rollout status statefulset/keeper
+```
+
+## Verify the quorum
+
+All three members should log that they are ready:
+
+```bash
+for i in 0 1 2; do
+  kubectl -n <quorum-namespace> logs keeper-$i | grep -m1 'Ready for connections'
+done
+```
+
+Ask each member for its role with the `mntr` four-letter command. The shipped image has neither `nc` nor `socat`, so the probe uses bash's `/dev/tcp`:
+
+```bash
+for i in 0 1 2; do
+  kubectl -n <quorum-namespace> exec keeper-$i -- bash -c \
+    'exec 3<>/dev/tcp/127.0.0.1/2181; printf mntr >&3; timeout 5 cat <&3' \
+    | grep -E 'zk_server_state|zk_synced_followers'
+done
+```
+
+Exactly one member reports `zk_server_state leader` and the others `follower`. A member that answers `This instance is not currently serving requests` is listening but has no quorum; check the other members' logs and that the three pods landed on three different nodes.
+
+## Point an instance at it
+
+```yaml
+spec:
+  configuration:
+    zookeeper:
+      nodes:
+        - host: keeper-0.keeper-headless.<quorum-namespace>
+        - host: keeper-1.keeper-headless.<quorum-namespace>
+        - host: keeper-2.keeper-headless.<quorum-namespace>
+```
+
+List the members individually, not the Service. The port defaults to 2181. Then confirm from the server side, as [Configure a replicated cluster](./configure_replicated_cluster.mdx) does:
+
+```sql
+SELECT name FROM system.zookeeper WHERE path = '/';
+```
+
+## Operating the quorum
+
+- **Do not scale with `kubectl scale`.** The member list lives in `raft_configuration`; changing `replicas` without changing the ConfigMap produces a member nobody votes for, or a configured member that never comes up. Stay at three, or go to five by editing both together.
+- **Keep the data volumes.** Deleting the StatefulSet keeps its PersistentVolumeClaims; deleting the claims deletes the coordination tree, and every replicated table that referenced it becomes read-only until its replicas are re-registered. Treat the keeper volumes as part of the database.
+- **Losing one member is survivable, losing two is not.** With one survivor the quorum stops serving, replicas go read-only (`is_readonly = 1` in `system.replicas`) and inserts into replicated tables fail with `TABLE_IS_READ_ONLY`. Service resumes by itself once a second member returns.
+- **Roll the quorum with the server image.** When the operand image changes, set the same tag here. The StatefulSet's rolling update restarts one member at a time, which a three-member quorum tolerates.

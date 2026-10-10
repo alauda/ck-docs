@@ -1,0 +1,212 @@
+---
+weight: 4
+---
+
+# Deploy as ACP logging storage
+
+This page builds the ClickHouse cluster that Alauda Container Platform Log Storage expects as its backend, in the three-node HA profile (one shard, three replicas) on three infra nodes. It stops where the logging installation chapter starts: at the end you have the endpoint, cluster name, database and account that chapter asks for in its ClickHouse connection Secret and PlatformLogForward.
+
+Follow this page before section 1.2 of the logging installation chapter. For the other profiles (single-node evaluation, six or nine node scale-out) change `shardsCount` and `replicasCount` and carry the same numbers into the PlatformLogForward.
+
+## Names the logging stack expects
+
+| Item | Value used on this page | Where the logging chapter reads it |
+|---|---|---|
+| Namespace | `cpaas-system` | all connection Secrets live here |
+| Instance name | `cpaas-clickhouse` | Service `clickhouse-cpaas-clickhouse` |
+| Endpoint | `http://clickhouse-cpaas-clickhouse.cpaas-system.svc:8123` | `endpoint` in `platform-default-ch-conn` |
+| Cluster name | `replicated` | `cluster` in the Secret; used by `ON CLUSTER` |
+| Database | `observability` | `database` in the Secret; must exist beforehand |
+| Account | `platform-logging` | `username` / `password` in the Secret |
+| Topology | 1 shard x 3 replicas | `shards` / `replicas` in the PlatformLogForward |
+
+These are the ACP baseline defaults. If you change one, change it in the logging chapter too.
+
+## Prerequisites
+
+- The operator is installed.
+- A three-member Keeper quorum, built as described in [Deploy a Keeper quorum](./deploy_keeper_quorum.mdx), in `cpaas-system`. Replication cannot start without it.
+- Three infra nodes (label and taint `node-role.kubernetes.io/infra`), each able to hold one Keeper member and one ClickHouse replica.
+- A StorageClass for the data volumes. Size them from the logging capacity planning guide, not from the example below.
+- Passwords for two accounts: an administrator you will use for one-time DDL, and `platform-logging`. Hash them once:
+
+  ```bash
+  printf '%s' '<password>' | sha256sum | cut -d' ' -f1
+  ```
+
+## The instance
+
+Save as `cpaas-clickhouse.yaml` after filling in the two hashes and, if needed, the StorageClass.
+
+```yaml
+apiVersion: clickhouse.altinity.com/v1
+kind: ClickHouseInstallation
+metadata:
+  name: cpaas-clickhouse
+  namespace: cpaas-system
+spec:
+  defaults:
+    templates:
+      dataVolumeClaimTemplate: data-volume
+      podTemplate: ch-pod
+      serviceTemplate: internal
+  configuration:
+    zookeeper:
+      nodes:
+        - host: keeper-0.keeper-headless.cpaas-system
+        - host: keeper-1.keeper-headless.cpaas-system
+        - host: keeper-2.keeper-headless.cpaas-system
+    clusters:
+      - name: replicated
+        secret:
+          auto: "yes"
+        layout:
+          shardsCount: 1
+          replicasCount: 3
+    users:
+      # One-time administration: creating the database, inspection.
+      admin/password_sha256_hex: <admin-sha256-hex>
+      admin/networks/ip:
+        - "::/0"
+      admin/access_management: "1"
+      # The account the logging data path uses. Full rights on the target
+      # database, plus the right to run ON CLUSTER statements.
+      platform-logging/password_sha256_hex: <platform-logging-sha256-hex>
+      platform-logging/networks/ip:
+        - "::/0"
+      platform-logging/grants/query:
+        - "GRANT ALL ON observability.*"
+        - "GRANT CLUSTER ON *.*"
+  templates:
+    serviceTemplates:
+      - name: internal
+        spec:
+          type: ClusterIP
+          ports:
+            - name: http
+              port: 8123
+            - name: tcp
+              port: 9000
+    podTemplates:
+      - name: ch-pod
+        podDistribution:
+          - type: ShardAntiAffinity
+        spec:
+          tolerations:
+            - key: node-role.kubernetes.io/infra
+              operator: Exists
+          affinity:
+            nodeAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                nodeSelectorTerms:
+                  - matchExpressions:
+                      - key: node-role.kubernetes.io/infra
+                        operator: Exists
+          securityContext:
+            runAsUser: 101
+            runAsGroup: 101
+            fsGroup: 101
+            runAsNonRoot: true
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: clickhouse
+              resources:
+                requests:
+                  cpu: "2"
+                  memory: 8Gi
+                limits:
+                  cpu: "4"
+                  memory: 16Gi
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop:
+                    - ALL
+    volumeClaimTemplates:
+      - name: data-volume
+        spec:
+          accessModes:
+            - ReadWriteOnce
+          # storageClassName: <storage-class>
+          resources:
+            requests:
+              storage: 200Gi
+```
+
+What the pieces do:
+
+- **`serviceTemplate: internal`** makes the instance-wide Service a ClusterIP. The default is a LoadBalancer, which stays without an address on clusters that have no provider, and the logging stack only ever connects from inside the cluster.
+- **`ShardAntiAffinity`** keeps the three replicas of the one shard on three different nodes; together with the node affinity, that is one replica per infra node.
+- **`networks/ip: "::/0"`** lets the logging pods, which run in other pods of the same namespace, reach the account. The operator's default allow-list is loopback only, so without this line every connection from the data path is refused. Narrow it to your pod CIDR if your policy requires it.
+- **`grants/query`** declares the account's privileges in the users configuration, so they exist on every replica without a `GRANT` statement. `CLUSTER` is needed because the logging schema migrations use `ON CLUSTER`.
+- **`secret: auto`** authenticates replica-to-replica traffic with an operator-generated secret.
+- There is no container image. The operator supplies the operand image it was installed with.
+
+Apply and wait for the three hosts:
+
+```bash
+kubectl -n cpaas-system apply -f cpaas-clickhouse.yaml
+kubectl -n cpaas-system get statefulset -l clickhouse.altinity.com/chi=cpaas-clickhouse \
+  -o custom-columns=NAME:.metadata.name,DESIRED:.spec.replicas,READY:.status.readyReplicas
+```
+
+## Create the database
+
+The logging chapter requires `observability` to exist before the storage operator starts. Create it once, on the cluster, as the administrator:
+
+```bash
+kubectl -n cpaas-system exec chi-cpaas-clickhouse-replicated-0-0-0 -c clickhouse -- \
+  clickhouse-client -u admin --password '<admin-password>' -q \
+  "CREATE DATABASE IF NOT EXISTS observability ON CLUSTER 'replicated'"
+```
+
+## Verify
+
+Cluster membership and coordination, as the administrator:
+
+```sql
+SELECT cluster, shard_num, replica_num, host_name
+FROM system.clusters WHERE cluster = 'replicated' ORDER BY replica_num;
+
+SELECT name FROM system.zookeeper WHERE path = '/';
+```
+
+Three rows for the first query, one shard with replica numbers 1 to 3. If the second fails, fix the quorum before continuing; see [ON CLUSTER DDL fails with NO_ELEMENTS_IN_CONFIG](../trouble_shooting/on_cluster_no_elements_in_config.mdx).
+
+Then prove the logging account can do what the migrations will do, from any pod in `cpaas-system`:
+
+```bash
+curl -s "http://clickhouse-cpaas-clickhouse.cpaas-system.svc:8123/" \
+  -u "platform-logging:<platform-logging-password>" --data-binary \
+  "CREATE TABLE observability.probe ON CLUSTER 'replicated' (ts DateTime) \
+   ENGINE = ReplicatedMergeTree('/clickhouse/tables/{shard}/observability/probe', '{replica}') ORDER BY ts"
+curl -s "http://clickhouse-cpaas-clickhouse.cpaas-system.svc:8123/" \
+  -u "platform-logging:<platform-logging-password>" --data-binary \
+  "DROP TABLE observability.probe ON CLUSTER 'replicated'"
+```
+
+Both commands print nothing on success. A `Not enough privileges` error names the missing privilege; add it to `grants/query` and re-apply the instance.
+
+## Hand over to the logging installation
+
+Continue with section 1.2 of the logging installation chapter using these values:
+
+| Field | Value |
+|---|---|
+| `platform-default-ch-conn` `endpoint` | `http://clickhouse-cpaas-clickhouse.cpaas-system.svc:8123` |
+| `platform-default-ch-conn` `cluster` | `replicated` |
+| `platform-default-ch-conn` `database` | `observability` |
+| `platform-default-ch-conn` `username` / `password` | `platform-logging` / the plain password you hashed |
+| `platform-default-ch-conn` `tls.ca` | omit; the endpoint is plain HTTP inside the cluster |
+| PlatformLogForward `externalStorage.shards` / `replicas` | `1` / `3` |
+
+The logging chapter's helper command reads the database name from `spec.configuration.settings.default_database`. This instance does not set that field, so the command prints an empty database; use `observability`.
+
+## Notes
+
+- **The `default` user is not for the data path.** It is restricted to loopback on purpose. Always give the logging stack its own account, as above.
+- **Placement belongs in the instance.** The logging documentation says not to patch generated ClickHouseInstallation resources for placement; that applies to resources the logging operator itself creates. This instance is yours, and its pod template is the right place for tolerations and affinity.
+- **Keeper and the database share the infra nodes.** Size the nodes for one Keeper member plus one replica each, using the logging capacity planning guide for the replica and a small fixed allowance for Keeper.
+- **Backup and retention** are handled by the logging documentation (TTL in the PlatformLogForward, backup how-tos); the operator provides neither.
