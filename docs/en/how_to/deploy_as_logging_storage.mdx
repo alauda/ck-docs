@@ -27,9 +27,9 @@ These are the ACP baseline defaults. If you change one, change it in the logging
 - The operator is installed.
 - A three-member Keeper quorum, built as described in [Deploy a Keeper quorum](./deploy_keeper_quorum.mdx), in `cpaas-system`. Replication cannot start without it.
 - Three infra nodes (label and taint `node-role.kubernetes.io/infra`), each able to hold one Keeper member and one ClickHouse replica.
-- A StorageClass for the data volumes. Size them from the logging capacity planning guide, not from the example below.
+- A StorageClass for the data volumes. It does not have to be the StorageClass the Keeper quorum uses; the two workloads have independent volumes, so pick whichever suits each. Size the data volumes from the logging capacity planning guide, not from the example below.
 - Free **requestable** capacity on the three nodes for the pod sizes you choose. Judge it from the "Allocated resources" section of `kubectl describe node`, not from `kubectl top`: on ACP the storage components (for example rook-ceph) reserve most of a small worker's requests while using little of it, and a pod that does not fit the remaining requests stays `Pending` with `Insufficient memory`.
-- Passwords for two accounts: an administrator you will use for one-time DDL, and `platform-logging`. Hash them once:
+- Two passwords of your choosing, one for each ClickHouse account the manifest below creates: `admin`, used only for one-time setup such as creating the database, and `platform-logging`, the account the logging service connects with. The manifest takes the SHA-256 hex digest of each password, in `admin/password_sha256_hex` and `platform-logging/password_sha256_hex`, not the password itself. Produce each digest with:
 
   ```bash
   printf '%s' '<password>' | sha256sum | cut -d' ' -f1
@@ -46,7 +46,7 @@ kubectl -n cpaas-system create secret generic cpaas-clickhouse-cluster-secret \
 
 ## The instance
 
-Save as `cpaas-clickhouse.yaml` after filling in the two hashes and, if needed, the StorageClass.
+Save as `cpaas-clickhouse.yaml` after filling in the two password digests. The data volume claim uses the cluster's default StorageClass; to use a different one, uncomment `storageClassName` and set it to the name of a StorageClass in your environment.
 
 ```yaml
 apiVersion: clickhouse.altinity.com/v1
@@ -142,7 +142,7 @@ spec:
         spec:
           accessModes:
             - ReadWriteOnce
-          # storageClassName: <storage-class>
+          # storageClassName: <storage-class>   # uncomment to use a StorageClass other than the default
           resources:
             requests:
               storage: 200Gi

@@ -20,7 +20,7 @@ There is a second supported shape: Keeper running inside the ClickHouse pods the
 
 - The operator is installed. Its Deployment is where you read the server image from.
 - Three nodes for the members. On ACP these are normally the infra nodes, labelled `node-role.kubernetes.io/infra` and tainted with the same key. The manifest below tolerates that taint and requires the label; with fewer than three such nodes, remove the anti-affinity block and accept that two members on one node share its failure.
-- A StorageClass. Coordination logs and snapshots are small; 10 GiB per member is ample.
+- A StorageClass. The manifest below uses the cluster's default StorageClass; any StorageClass that provides `ReadWriteOnce` volumes works. Coordination logs and snapshots are small; 10 GiB per member is ample.
 - A namespace for the quorum. The instance namespace is the simplest choice. A separate namespace also works; the instance then uses fully qualified addresses.
 
 ## Resolve the server image
@@ -39,7 +39,7 @@ Put the printed value in the `image` field below. Use the same value every time 
 
 ## The manifest
 
-Save as `keeper.yaml` after replacing `<quorum-namespace>`, `<server-image>` and, if you do not want the default StorageClass, `<storage-class>`.
+Save as `keeper.yaml` after replacing `<quorum-namespace>` and `<server-image>`. The volume claim uses the cluster's default StorageClass. To use a different one, uncomment `storageClassName` and set it to the name of a StorageClass in your environment.
 
 ```yaml
 apiVersion: v1
@@ -196,7 +196,7 @@ spec:
       spec:
         accessModes:
           - ReadWriteOnce
-        # storageClassName: <storage-class>
+        # storageClassName: <storage-class>   # uncomment to use a StorageClass other than the default
         resources:
           requests:
             storage: 10Gi
