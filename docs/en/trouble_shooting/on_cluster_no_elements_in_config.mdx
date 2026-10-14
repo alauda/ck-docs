@@ -78,7 +78,14 @@ DROP DATABASE IF EXISTS probe ON CLUSTER '{cluster}';
 
 ## If nodes are declared and it still fails
 
-The element is present but unusable. Check, in order:
+The error then changes to:
+
+```
+Code: 999. DB::Exception: Coordination::Exception: Cannot use any of provided ZooKeeper nodes.
+(KEEPER_EXCEPTION)
+```
+
+The element is present but unusable: the server tried every declared address and none accepted a session. Check, in order:
 
 1. **Name resolution and reachability** from a server pod to each declared address and port.
 2. **Quorum health.** A quorum with no elected leader answers nothing useful. Check its own status.

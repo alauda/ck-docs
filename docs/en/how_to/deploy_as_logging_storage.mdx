@@ -215,6 +215,21 @@ kubectl -n cpaas-system exec chi-cpaas-clickhouse-replicated-0-0-0 -c clickhouse
 
 The command prints nothing on success.
 
+If it fails instead with `Code: 999 ... Coordination::Exception: Cannot use any of provided ZooKeeper nodes. (KEEPER_EXCEPTION)`, the instance is fine but it could not open a session to any of the three Keeper members. This is a Keeper problem, not a database one. The usual reasons, in order:
+
+- **The quorum is not in `cpaas-system`.** The manifest above names `keeper-0.keeper-headless.cpaas-system` and its two siblings. A quorum deployed in another namespace, or under another name, does not resolve.
+- **The pods exist but never formed a quorum.** The Keeper manifest needs three nodes with the `node-role.kubernetes.io/infra` label, one pod per node. On a cluster with fewer such nodes the pods stay `Pending`. A member running without a quorum still shows `Ready`, but answers `This instance is not currently serving requests`.
+- **Port 2181 is blocked** by a NetworkPolicy in `cpaas-system`.
+
+Run step 3 of [Deploy a Keeper quorum](./deploy_keeper_quorum.mdx) to tell these apart, then look at the server log:
+
+```bash
+kubectl -n cpaas-system get pods -l app=keeper -o wide
+kubectl -n cpaas-system logs chi-cpaas-clickhouse-replicated-0-0-0 -c clickhouse | grep -iE 'keeper|zookeeper' | tail -20
+```
+
+The log shows which of the three it is: a name that does not resolve, a connection refused, or a session rejected. Once one member reports `zk_server_state leader`, run the `CREATE DATABASE` command again; nothing needs to change on the instance.
+
 ## Step 5: verify
 
 Check the cluster membership and the connection to Keeper. Run each query with the same `clickhouse-client` command as in step 4, passing the query after `-q`:
