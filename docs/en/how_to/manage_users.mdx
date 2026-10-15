@@ -126,6 +126,12 @@ curl -s "http://clickhouse-<instance>.<namespace>.svc:8123/" \
 
 Expect `app` again. An `Authentication failed` here, after the first command worked, means the address is not allowed: check `networks/ip`.
 
+## Where the password is kept
+
+Nowhere in the cluster, for an account declared with a hash. The manifest, the ConfigMap and the file in the pod all hold only the SHA-256 hash, which cannot be turned back into the password. Keep the plain password where your application keeps it. If it is lost, set a new one as described in the next section.
+
+The exceptions: a plain `password:` key stays readable in the instance manifest; a Secret-backed account's reference, shown by `kubectl -n <namespace> get chi <instance> -o jsonpath='{.spec.configuration.users}'`, points at the Secret, which holds whatever you stored there; and the operator's own account keeps a plain password in the Secret `clickhouse-operator` in the `operators` namespace.
+
 ## Change a password
 
 Replace the hash in the manifest with the hash of the new password and apply the manifest. Within about a minute the old password stops working and the new one works; nothing restarts. Connections that are already open stay open until the client closes them.
