@@ -1,0 +1,134 @@
+---
+weight: 6
+---
+
+# Expand storage
+
+When a data volume is filling up, grow it by raising the size in the instance's volume claim template. The operator resizes each PersistentVolumeClaim (PVC) and rolls the change through the instance one host at a time.
+
+Two things to know before you start:
+
+- **Every host restarts once.** A StatefulSet's volume claim templates cannot be changed in place, so the operator deletes and recreates each host's StatefulSet with the new size. The pod goes down while that happens, typically for under a minute. The data on the volume is kept.
+- **Volumes only grow.** Kubernetes refuses to make a PVC smaller than its current capacity.
+
+## Know when a volume is filling up
+
+Ask ClickHouse directly. Run this on each host:
+
+```bash
+kubectl -n <namespace> exec <pod> -c clickhouse -- clickhouse-client -q "
+  SELECT name, path,
+         formatReadableSize(free_space)  AS free,
+         formatReadableSize(total_space) AS total,
+         round(100 * (1 - free_space / total_space), 1) AS used_pct
+  FROM system.disks"
+```
+
+The figures match `df` on the data directory `/var/lib/clickhouse`.
+
+The operator's metrics exporter publishes the same figures for every host as `chi_clickhouse_metric_DiskFreeBytes` and `chi_clickhouse_metric_DiskTotalBytes`, labeled with `chi`, `namespace`, `hostname` and `disk`. To be warned before a volume runs out, alert on the free fraction, for example:
+
+```text
+chi_clickhouse_metric_DiskFreeBytes / chi_clickhouse_metric_DiskTotalBytes < 0.1
+```
+
+Plan the expansion while there is still room. Merges need free space to write the merged part before the old parts are removed.
+
+## Before you start
+
+1. **Check that the StorageClass allows expansion.** Find the class from the PVCs, then read its flag:
+
+   ```bash
+   kubectl -n <namespace> get pvc -l clickhouse.altinity.com/chi=<instance> \
+     -o custom-columns=NAME:.metadata.name,SC:.spec.storageClassName,CAPACITY:.status.capacity.storage
+
+   kubectl get storageclass <storage-class> -o jsonpath='{.allowVolumeExpansion}{"\n"}'
+   ```
+
+   The second command must print `true`. If it prints nothing or `false`, stop here and see [The volume did not grow](#the-volume-did-not-grow). The operator does not refuse the change on such a class; it restarts every host and leaves the volumes at their old size.
+
+2. **Plan for the restarts.** Hosts are handled one after another, so with `replicasCount: 1` each shard is unavailable while its own host restarts. With two or more replicas per shard, the other replicas keep serving that shard.
+
+3. **Find the template to change.** The data volume comes from the template named in `spec.defaults.templates.dataVolumeClaimTemplate` (or in a cluster-, shard- or replica-level override). The log volume, if any, comes from `logVolumeClaimTemplate`.
+
+## Expand the volume
+
+### Step 1: Raise the size in the instance
+
+Change `storage` in the volume claim template, and only there:
+
+```yaml
+spec:
+  templates:
+    volumeClaimTemplates:
+      - name: data-volume
+        spec:
+          accessModes:
+            - ReadWriteOnce
+          storageClassName: <storage-class>
+          resources:
+            requests:
+              storage: 200Gi   # was 100Gi
+```
+
+Apply the manifest, or edit the live object with `kubectl -n <namespace> edit chi <instance>`.
+
+If the template comes from a `ClickHouseInstallationTemplate`, change it there. Every instance that uses the template is then resized and restarted.
+
+### Step 2: Watch the rollout
+
+```bash
+kubectl -n <namespace> get chi <instance> -w
+
+kubectl -n <namespace> get pvc -l clickhouse.altinity.com/chi=<instance> \
+  -o custom-columns=NAME:.metadata.name,REQUEST:.spec.resources.requests.storage,CAPACITY:.status.capacity.storage,CONDITIONS:.status.conditions[*].type
+```
+
+For each host in turn, the operator:
+
+1. raises the PVC's request. The PVC briefly shows `Resizing` or `FileSystemResizePending` while the storage backend grows the volume;
+2. deletes the host's StatefulSet and creates it again with the new size, which restarts the pod;
+3. waits for the pod to be ready before it moves to the next host.
+
+Depending on the storage driver, the filesystem is grown either while the pod is still running or when the new pod mounts the volume. Either way, `CAPACITY` shows the new size by the time the host is back. The instance returns to `Completed` after the last host.
+
+### Step 3: Verify
+
+`Completed` only means the operator finished its pass. It does not prove that the volumes grew. Check the volumes themselves:
+
+- `CAPACITY` in the PVC listing above shows the new size for every PVC of the instance.
+- `system.disks` (see the first section) shows the new `total` on every host.
+
+## The volume did not grow \{#the-volume-did-not-grow\}
+
+**Symptom:** after the change, every pod restarted and the instance is `Completed`, but `CAPACITY` still shows the old size. No Kubernetes Event and no entry in the instance's `status.errors` mentions it.
+
+The reason is only in the operator log:
+
+```bash
+kubectl -n <operator-namespace> logs deploy/clickhouse-operator -c clickhouse-operator \
+  | grep 'unable to Update PVC'
+```
+
+| Message contains | Cause | What to do |
+| --- | --- | --- |
+| `only dynamically provisioned pvc can be resized and the storageclass that provisions the pvc must support resize` | The StorageClass does not allow expansion. | Set the size in the instance back to the current capacity. Then ask your platform administrator whether expansion can be enabled on the StorageClass. That depends on the CSI driver behind it. |
+| `field can not be less than status.capacity` | The new size is smaller than the volume already is. | Set the size back to the current capacity. Volumes cannot be shrunk. |
+
+Setting the size back causes one more rolling restart of every host, because the StatefulSets are recreated again. Until you do, the operator logs the same error on every reconcile, and any host added later is created from the template with a size that does not match the others.
+
+## Do not resize the PVC directly
+
+Change the size in the instance, not on the PVC. On every reconcile, the operator sets each PVC's request to the size in its template. If you enlarge a PVC by hand:
+
+- the volume does grow, without a restart;
+- the next reconcile tries to set it back to the smaller template size, which Kubernetes refuses. That logs `field can not be less than status.capacity` on every reconcile from then on;
+- hosts added later get the old, smaller size.
+
+If a PVC has already been resized by hand, raise the template to the same size. That costs one rolling restart, after which the errors stop.
+
+---
+
+ClickHouse is a registered trademark of ClickHouse, Inc. https://clickhouse.com
+
+Alauda is an independent vendor. This product is not affiliated with, endorsed by, or sponsored by ClickHouse, Inc. All trademarks are the property of their respective owners and are used here for identification purposes only.
