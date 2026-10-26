@@ -65,7 +65,7 @@ The manifest then uses `app/k8s_secret_password_sha256_hex: <namespace>/<instanc
 
 ## Step 3: declare the account
 
-Edit the instance and add the account under `spec.configuration.users`. The example adds one account, `app`, that may connect from any pod in the cluster and may use only the database `analytics`. Replace the placeholders:
+Edit the instance and add the account under `spec.configuration.users`. The example adds one account, `app`, that may connect from any pod in the cluster, may use only the database `analytics`, and may run `ON CLUSTER` statements in it. Replace the placeholders:
 
 | Placeholder | Replace with | Required |
 |---|---|---|
@@ -82,6 +82,7 @@ spec:
       app/profile: default
       app/grants/query:
         - "GRANT ALL ON analytics.*"
+        - "GRANT CLUSTER ON *.*"
 ```
 
 What each line does:
@@ -90,6 +91,7 @@ What each line does:
 - **`networks/ip: "::/0"`** lets the account connect from any address. Without it the operator adds only `::1` and `127.0.0.1`, which is the pod itself, and connections from other pods are refused. Narrow it to your application's address range when you can; the list may have several entries.
 - **`profile: default`** attaches the built-in settings profile. Declare your own profile under `spec.configuration.profiles` to cap memory or make the account read-only; [Access the instance](../functions/10_access.mdx) shows the syntax.
 - **`grants/query`** lists `GRANT` statements that run for this account every time the file is loaded. They are the same statements you would type as SQL, without the `TO <user>` part.
+- **`GRANT CLUSTER ON *.*`** lets the account add `ON CLUSTER` to a statement, which is how a replicated table is created on every replica at once. Without it, such a statement fails with `Code: 497 ... it's necessary to have the grant CLUSTER ON *.*`, even though the same statement without `ON CLUSTER` works. It does not widen what the account may touch: an `ON CLUSTER` statement still needs the account's privileges on the objects it names, so `app` remains limited to `analytics`. Leave the line out if the account never runs `ON CLUSTER` statements.
 
 Apply the manifest and wait for the operator:
 
@@ -117,7 +119,15 @@ kubectl -n <namespace> exec chi-<instance>-<cluster>-0-0-0 -c clickhouse -- \
   clickhouse-client -u app --password '<app-password>' -q "SELECT currentUser()"
 ```
 
-Expect `app`. Then from any other pod in the cluster, through the instance Service, which is what your application will use:
+Expect `app`. Then log in through the instance Service, which is what your application will use. From a pod of another replica:
+
+```bash
+kubectl -n <namespace> exec chi-<instance>-<cluster>-0-1-0 -c clickhouse -- \
+  clickhouse-client -h clickhouse-<instance>.<namespace>.svc \
+  -u app --password '<app-password>' -q "SELECT currentUser()"
+```
+
+On a single-replica instance, use `0-0-0` again; the connection still goes through the Service. The server image has no `curl`. From your application's pod you can check the HTTP port instead:
 
 ```bash
 curl -s "http://clickhouse-<instance>.<namespace>.svc:8123/" \
@@ -134,7 +144,9 @@ The exceptions: a plain `password:` key stays readable in the instance manifest;
 
 ## Change a password
 
-Replace the hash in the manifest with the hash of the new password and apply the manifest. Within about a minute the old password stops working and the new one works; nothing restarts. Connections that are already open stay open until the client closes them.
+Replace the hash in the manifest with the hash of the new password and apply the manifest. Within one to two minutes the old password stops working and the new one works on every replica (about 75 seconds on the slowest of three replicas in testing); nothing restarts. Connections that are already open stay open until the client closes them.
+
+The replicas do not switch at the same moment. Each pod reloads the file on its own, so for roughly 30 seconds one replica may accept only the old password while another accepts only the new one, and a login through the Service succeeds or fails depending on which replica it lands on. Switch your application to the new password only after the old one is refused on every replica, or give it both and let it retry.
 
 If the hash lives in a Secret, update the Secret and then make the operator process the instance again. The operator does not watch Secrets, so a Secret change on its own changes nothing in the pods. Set `spec.taskID` to any new value to trigger the operator:
 
