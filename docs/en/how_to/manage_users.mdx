@@ -202,7 +202,7 @@ Three things to know before you rely on this:
 ## Notes
 
 - A plain `password:` key is accepted and the operator hashes it before writing the ConfigMap, but the manifest itself is readable by anyone who can read the instance. Use `password_sha256_hex`, or a Secret.
-- Besides the address list, the operator sets a hostname pattern on every account that admits only the instance's own pods and its Service in the same namespace. If connections from another namespace are refused with the right password and a wide `networks/ip`, that pattern is the reason; [Access the instance](../functions/10_access.mdx) describes it.
+- Besides the address list, the operator adds a hostname pattern to every account that matches the instance's own pods. It only adds access. ClickHouse admits a connection that matches any entry under `networks`, so the pattern never blocks a connection that `networks/ip` allows, and with `::/0` declared it makes no difference. To keep an account to your application, narrow `networks/ip` to the application's address range; [Access the instance](../functions/10_access.mdx) has more on the defaults.
 - Profiles and quotas follow the same key syntax under `spec.configuration.profiles` and `spec.configuration.quotas`, and reload the same way.
 
 ---

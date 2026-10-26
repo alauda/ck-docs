@@ -122,7 +122,7 @@ printf '%s' '<password>' | sha256sum | cut -d' ' -f1
 
 The shipped operator defaults give the `default` user the `default` profile, the `default` quota, and a network allow-list of `::1` and `127.0.0.1` only. It is therefore not usable from other pods. Declare your own user rather than loosening `default`.
 
-A host regular expression is also applied by default, restricting inbound connections to names matching the instance's own pods and its instance-wide Service within the same namespace. If you widen `networks/ip` and connections are still refused, this is the second gate to look at.
+The operator also adds a host regular expression to every account, matching the names of the instance's own pods. It is an extra allowance, not a second restriction: ClickHouse admits a connection that matches any entry under `networks`. It never blocks a connection that `networks/ip` allows, so restrict access by narrowing `networks/ip`.
 
 ### The operator's own account
 
