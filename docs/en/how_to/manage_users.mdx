@@ -1,0 +1,212 @@
+---
+weight: 5
+---
+
+# Manage users
+
+Every application that connects to Alauda Data Services Analytical Database E1 needs an account: a user name, a password, and a list of what that account may do. This page shows how to create such accounts, change their passwords, give them privileges, and remove them again, without restarting the database.
+
+When you are done you have accounts that live in the instance manifest, so that they are versioned with it, re-created with it, and present on every replica the instance will ever have.
+
+## Steps at a glance
+
+1. Decide where the account lives: in the instance manifest, or inside the database.
+2. Turn the password into a hash, or store it in a Secret.
+3. Declare the account in the manifest and apply the manifest.
+4. Check that the account can log in.
+
+Plan for about ten minutes. Changing a password, adding privileges and removing an account are each a one-line edit of the same manifest and are covered after step 4.
+
+## Before you start: how accounts reach the database
+
+- **The manifest is the source.** Accounts, profiles and quotas are written under `spec.configuration` of the `ClickHouseInstallation`. The operator turns that block into a configuration file, `users.d/chop-generated-users.xml`, puts it into a ConfigMap named `chi-<instance>-common-usersd`, and mounts that ConfigMap into every pod of the instance.
+- **No restart.** The database server watches its `users.d` directory and reloads it when the file changes. The pods are not restarted when you change accounts; the StatefulSets do not change, so the operator leaves them alone. Expect the new content to be live within about a minute, which is how long Kubernetes takes to refresh a mounted ConfigMap.
+- **The key syntax is a path.** A key such as `app/networks/ip` means: the account `app`, element `networks`, element `ip` inside it. Everything before the first `/` names the account, profile or quota. A list value produces one element per item.
+- **Two accounts are already there.** `default` exists but may only connect from inside its own pod, on purpose. `clickhouse_operator` is the operator's own account; it reads metrics and copies schema to new replicas. Leave both alone. [Access the instance](../functions/10_access.mdx) explains them.
+
+## Prerequisites
+
+| You need | Details |
+|---|---|
+| A running instance | `kubectl -n <namespace> get chi <instance>` shows `Completed`. |
+| `kubectl` access to its namespace | You will edit the instance and read its pods. |
+| `sha256sum` | Any Linux shell has it. It turns the password into the hash that goes into the manifest. |
+
+## Step 1: choose where the account lives
+
+| | Declared in the manifest | Created with SQL |
+|---|---|---|
+| How | Keys under `spec.configuration.users` | `CREATE USER ... ON CLUSTER` as an account that has `access_management` |
+| Stored | In the instance manifest, rendered to every pod | On each replica's data volume, under `/var/lib/clickhouse/access` |
+| Present on replicas added later | Yes, automatically | No. The operator copies tables to new replicas, not accounts; you run the statement again |
+| Who can change it | Whoever can edit the instance | Whoever holds an `access_management` account |
+| Best for | Service accounts, the logging platform, anything scripted | Short-lived or interactive accounts, roles and row policies |
+
+This page uses the manifest. The SQL form is covered at the end, for the cases where it fits better.
+
+## Step 2: prepare the password
+
+The manifest never holds the password itself. It holds a SHA-256 hash of it, a 64-character hexadecimal string, and the database compares the hash of what the client sends with it. Produce the hash with:
+
+```bash
+printf '%s' '<password>' | sha256sum | cut -d' ' -f1
+```
+
+Expect one line of 64 hexadecimal characters. Keep the plain password for your application and for step 4; the hash goes into the manifest.
+
+If you would rather not have even the hash in the manifest, put it into a Secret in the instance's namespace and point the manifest at it:
+
+```bash
+kubectl -n <namespace> create secret generic <instance>-users \
+  --from-literal=app-sha256=<app-sha256-hex>
+```
+
+The manifest then uses `app/k8s_secret_password_sha256_hex: <namespace>/<instance>-users/app-sha256` instead of `app/password_sha256_hex`. The value is `<namespace>/<secret-name>/<key>`. The operator reads the Secret when it processes the instance and writes the hash into the ConfigMap, exactly as if it had been in the manifest. See "Change a password" below for what that means when you rotate it.
+
+## Step 3: declare the account
+
+Edit the instance and add the account under `spec.configuration.users`. The example adds one account, `app`, that may connect from any pod in the cluster, may use only the database `analytics`, and may run `ON CLUSTER` statements in it. Replace the placeholders:
+
+| Placeholder | Replace with | Required |
+|---|---|---|
+| `<app-sha256-hex>` | The hash from step 2. | Yes |
+| `analytics` | The database the account works in. Create it first, or drop the `grants/query` lines and add them once it exists. | No |
+
+```yaml
+spec:
+  configuration:
+    users:
+      app/password_sha256_hex: <app-sha256-hex>
+      app/networks/ip:
+        - "::/0"
+      app/profile: default
+      app/grants/query:
+        - "GRANT ALL ON analytics.*"
+        - "GRANT CLUSTER ON *.*"
+```
+
+What each line does:
+
+- **`password_sha256_hex`** sets the password. Always set one. An account with no password key accepts an empty password.
+- **`networks/ip: "::/0"`** lets the account connect from any address. Without it the operator adds only `::1` and `127.0.0.1`, which is the pod itself, and connections from other pods are refused. Narrow it to your application's address range when you can; the list may have several entries.
+- **`profile: default`** attaches the built-in settings profile. Declare your own profile under `spec.configuration.profiles` to cap memory or make the account read-only; [Access the instance](../functions/10_access.mdx) shows the syntax.
+- **`grants/query`** lists `GRANT` statements that run for this account every time the file is loaded. They are the same statements you would type as SQL, without the `TO <user>` part.
+- **`GRANT CLUSTER ON *.*`** lets the account add `ON CLUSTER` to a statement, which is how a replicated table is created on every replica at once. Without it, such a statement fails with `Code: 497 ... it's necessary to have the grant CLUSTER ON *.*`, even though the same statement without `ON CLUSTER` works. It does not widen what the account may touch: an `ON CLUSTER` statement still needs the account's privileges on the objects it names, so `app` remains limited to `analytics`. Leave the line out if the account never runs `ON CLUSTER` statements.
+
+Apply the manifest and wait for the operator:
+
+```bash
+kubectl -n <namespace> apply -f <instance>.yaml
+kubectl -n <namespace> get chi <instance> -w
+```
+
+The `STATUS` column goes through `InProgress` and returns to `Completed`; press `Ctrl-C` then. Confirm that nothing restarted and that the file reached a pod:
+
+```bash
+kubectl -n <namespace> get pods -l clickhouse.altinity.com/chi=<instance>
+kubectl -n <namespace> exec chi-<instance>-<cluster>-0-0-0 -c clickhouse -- \
+  grep -c '<app>' /etc/clickhouse-server/users.d/chop-generated-users.xml
+```
+
+The pods show the same `AGE` as before, and the second command prints `1`. If it prints `0`, wait a minute and run it again; the ConfigMap has not been refreshed in the pod yet.
+
+## Step 4: check the login
+
+From inside a pod of the instance, with the plain password:
+
+```bash
+kubectl -n <namespace> exec chi-<instance>-<cluster>-0-0-0 -c clickhouse -- \
+  clickhouse-client -u app --password '<app-password>' -q "SELECT currentUser()"
+```
+
+Expect `app`. Then log in through the instance Service, which is what your application will use. From a pod of another replica:
+
+```bash
+kubectl -n <namespace> exec chi-<instance>-<cluster>-0-1-0 -c clickhouse -- \
+  clickhouse-client -h clickhouse-<instance>.<namespace>.svc \
+  -u app --password '<app-password>' -q "SELECT currentUser()"
+```
+
+On a single-replica instance, use `0-0-0` again; the connection still goes through the Service. The server image has no `curl`. From your application's pod you can check the HTTP port instead:
+
+```bash
+curl -s "http://clickhouse-<instance>.<namespace>.svc:8123/" \
+  -u "app:<app-password>" --data-binary "SELECT currentUser()"
+```
+
+Expect `app` again. An `Authentication failed` here, after the first command worked, means the address is not allowed: check `networks/ip`.
+
+## Where the password is kept
+
+Nowhere in the cluster, for an account declared with a hash. The manifest, the ConfigMap and the file in the pod all hold only the SHA-256 hash, which cannot be turned back into the password. Keep the plain password where your application keeps it. If it is lost, set a new one as described in the next section.
+
+The exceptions: a plain `password:` key stays readable in the instance manifest; a Secret-backed account's reference, shown by `kubectl -n <namespace> get chi <instance> -o jsonpath='{.spec.configuration.users}'`, points at the Secret, which holds whatever you stored there; and the operator's own account keeps a plain password in the Secret `clickhouse-operator` in the `operators` namespace.
+
+## Change a password
+
+Replace the hash in the manifest with the hash of the new password and apply the manifest. Within one to two minutes the old password stops working and the new one works on every replica (about 75 seconds on the slowest of three replicas in testing); nothing restarts. Connections that are already open stay open until the client closes them.
+
+The replicas do not switch at the same moment. Each pod reloads the file on its own, so for roughly 30 seconds one replica may accept only the old password while another accepts only the new one, and a login through the Service succeeds or fails depending on which replica it lands on. Switch your application to the new password only after the old one is refused on every replica, or give it both and let it retry.
+
+If the hash lives in a Secret, update the Secret and then make the operator process the instance again. The operator does not watch Secrets, so a Secret change on its own changes nothing in the pods. Set `spec.taskID` to any new value to trigger the operator:
+
+```bash
+kubectl -n <namespace> create secret generic <instance>-users \
+  --from-literal=app-sha256=<new-app-sha256-hex> --dry-run=client -o yaml | kubectl apply -f -
+kubectl -n <namespace> patch chi <instance> --type merge \
+  -p "{\"spec\":{\"taskID\":\"rotate-$(date +%s)\"}}"
+```
+
+Then watch the instance return to `Completed` as in step 3 and check the login as in step 4.
+
+## Give an account more privileges
+
+Add a line to its `grants/query` list and apply the manifest:
+
+```yaml
+      app/grants/query:
+        - "GRANT ALL ON analytics.*"
+        - "GRANT SELECT ON reporting.*"
+```
+
+Any `GRANT` the database understands is accepted, including `GRANT CLUSTER ON *.*` for `ON CLUSTER` statements and `GRANT <role>` for a role created with SQL. An error at reload time appears in the server log, not at apply time, so after a change run a query that needs the new privilege, as the account.
+
+## Remove an account
+
+Delete every key that starts with the account's name and apply the manifest. From the next reload on, the account no longer exists and new connections as that account are refused.
+
+## Accounts created with SQL
+
+Give one manifest account the right to manage others:
+
+```yaml
+      admin/password_sha256_hex: <admin-sha256-hex>
+      admin/networks/ip:
+        - "::/0"
+      admin/access_management: "1"
+```
+
+That account can then create users, roles, row policies and quotas with SQL:
+
+```sql
+CREATE USER analyst ON CLUSTER '{cluster}' IDENTIFIED WITH sha256_hash BY '<analyst-sha256-hex>';
+GRANT ON CLUSTER '{cluster}' SELECT ON analytics.* TO analyst;
+```
+
+Three things to know before you rely on this:
+
+- **`ON CLUSTER` needs the coordination quorum.** Without one the statement fails with `NO_ELEMENTS_IN_CONFIG`; see [Configure a replicated cluster](./configure_replicated_cluster.mdx). Without `ON CLUSTER` the account exists on one replica only.
+- **Replicas added later start without these accounts.** When you raise `replicasCount` or `shardsCount`, the operator copies tables to the new hosts, not accounts. Run the statements again, or declare the account in the manifest instead.
+- **Do not create an SQL account with a name that the manifest declares.** The manifest version is loaded from a file and cannot be altered or dropped with SQL; the statement fails.
+
+## Notes
+
+- A plain `password:` key is accepted and the operator hashes it before writing the ConfigMap, but the manifest itself is readable by anyone who can read the instance. Use `password_sha256_hex`, or a Secret.
+- Besides the address list, the operator adds a hostname pattern to every account that matches the instance's own pods. It only adds access. ClickHouse admits a connection that matches any entry under `networks`, so the pattern never blocks a connection that `networks/ip` allows, and with `::/0` declared it makes no difference. To keep an account to your application, narrow `networks/ip` to the application's address range; [Access the instance](../functions/10_access.mdx) has more on the defaults.
+- Profiles and quotas follow the same key syntax under `spec.configuration.profiles` and `spec.configuration.quotas`, and reload the same way.
+
+---
+
+ClickHouse is a registered trademark of ClickHouse, Inc. https://clickhouse.com
+
+Alauda is an independent vendor. This product is not affiliated with, endorsed by, or sponsored by ClickHouse, Inc. All trademarks are the property of their respective owners and are used here for identification purposes only.
