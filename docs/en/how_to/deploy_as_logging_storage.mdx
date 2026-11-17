@@ -38,7 +38,7 @@ These are the ACP baseline defaults. If you change one of them, change it in the
 | You need | Details |
 |---|---|
 | The operator installed | The instance below is created through the operator. |
-| A Keeper quorum | Three members in `cpaas-system`, built as described in [Deploy a Keeper quorum](./deploy_keeper_quorum.mdx). Replication cannot start without it. |
+| A Keeper quorum | A three-member `ClickHouseKeeperInstallation` named `keeper` in `cpaas-system`, created as described in [Deploy a Keeper quorum](./deploy_keeper_quorum.mdx). Replication cannot start without it. A quorum you built by hand with an earlier release of that guide also works; see the note under the manifest. |
 | Three infra nodes | Labelled and tainted `node-role.kubernetes.io/infra`. Each node holds one Keeper member and one ClickHouse replica. |
 | A StorageClass for the data volumes | The manifest uses your cluster's default StorageClass. It does not have to be the one the Keeper quorum uses; the two workloads have separate volumes, so choose whatever suits each. Size the data volumes from the logging capacity planning guide, not from the example value below. |
 | Free capacity on the three nodes | Kubernetes places a pod by comparing the pod's resource *requests* with what is still unreserved on a node, not with what the node is currently using. Check the "Allocated resources" section of `kubectl describe node <node>` for each infra node, and make sure the CPU and memory that are still free cover the requests in the manifest. `kubectl top` does not tell you this. On ACP the storage components (for example rook-ceph) reserve a large share of a small worker while using little of it; a pod that does not fit stays `Pending` with `Insufficient memory`. |
@@ -97,10 +97,9 @@ spec:
       serviceTemplate: internal
   configuration:
     zookeeper:
-      nodes:
-        - host: keeper-0.keeper-headless.cpaas-system
-        - host: keeper-1.keeper-headless.cpaas-system
-        - host: keeper-2.keeper-headless.cpaas-system
+      keeper:
+        name: keeper
+        namespace: cpaas-system
     clusters:
       - name: replicated
         secret:
@@ -185,7 +184,7 @@ spec:
 
 What the pieces do:
 
-- **`zookeeper.nodes`** lists the three Keeper members from the prerequisites. Replication and `ON CLUSTER` statements go through them.
+- **`zookeeper.keeper`** names the Keeper quorum from the prerequisites. The operator resolves it to the three members' addresses; replication and `ON CLUSTER` statements go through them. If you run a quorum you built by hand instead, replace the `keeper` block with `nodes:` and one `- host: keeper-<n>.keeper-headless.cpaas-system` entry per member; do not set both.
 - **`secret.valueFrom.secretKeyRef`** points at the Secret you created in step 2, so that the replicas authenticate each other. Do not replace it with `secret: auto`: on ACP the operator may only read Secrets, so the Secret that `auto` is supposed to generate never appears and every pod stays in `CreateContainerConfigError`.
 - **`users`** creates the two accounts. `access_management` lets `admin` manage users and grants. `grants/query` gives `platform-logging` its privileges on every replica without you running a `GRANT` statement; `CLUSTER` is needed because the logging schema migrations use `ON CLUSTER`. Note that `ALL ON observability.*` is broad: it also covers user, role and row-policy management inside that database. Narrow it to `SELECT, INSERT, CREATE, ALTER, DROP ON observability.*` if least privilege matters more than simplicity.
 - **`networks/ip: "::/0"`** lets other pods reach the two accounts. Without it, an account may only connect from inside its own pod, so every connection from the logging service would be refused. Narrow it to your pod network range if your policy requires it.
@@ -217,14 +216,14 @@ The command prints nothing on success.
 
 If it fails instead with `Code: 999 ... Coordination::Exception: Cannot use any of provided ZooKeeper nodes. (KEEPER_EXCEPTION)`, the instance is fine but it could not open a session to any of the three Keeper members. This is a Keeper problem, not a database one. The usual reasons, in order:
 
-- **The quorum is not in `cpaas-system`.** The manifest above names `keeper-0.keeper-headless.cpaas-system` and its two siblings. A quorum deployed in another namespace, or under another name, does not resolve.
-- **The pods exist but never formed a quorum.** The Keeper manifest needs three nodes with the `node-role.kubernetes.io/infra` label, one pod per node. On a cluster with fewer such nodes the pods stay `Pending`. A member running without a quorum still shows `Ready`, but answers `This instance is not currently serving requests`.
+- **The quorum is not where the manifest says.** The manifest names the `ClickHouseKeeperInstallation` `keeper` in `cpaas-system`. Check `kubectl -n cpaas-system get chk keeper`: it must exist and report `Completed`.
+- **The pods exist but never formed a quorum.** The Keeper manifest needs three nodes with the `node-role.kubernetes.io/infra` label, one pod per node. On a cluster with fewer such nodes the pods stay `Pending`. Step 2 of [Deploy a Keeper quorum](./deploy_keeper_quorum.mdx) shows how to check the leader and followers.
 - **Port 2181 is blocked** by a NetworkPolicy in `cpaas-system`.
 
-Run step 3 of [Deploy a Keeper quorum](./deploy_keeper_quorum.mdx) to tell these apart, then look at the server log:
+Run step 2 of [Deploy a Keeper quorum](./deploy_keeper_quorum.mdx) to tell these apart, then look at the server log:
 
 ```bash
-kubectl -n cpaas-system get pods -l app=keeper -o wide
+kubectl -n cpaas-system get pods -l clickhouse-keeper.altinity.com/chk=keeper -o wide
 kubectl -n cpaas-system logs chi-cpaas-clickhouse-replicated-0-0-0 -c clickhouse | grep -iE 'keeper|zookeeper' | tail -20
 ```
 

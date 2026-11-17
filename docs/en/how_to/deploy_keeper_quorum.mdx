@@ -4,24 +4,29 @@ weight: 3
 
 # Deploy a Keeper quorum
 
-ClickHouse can keep several copies of a table in sync (replication) only when a small coordination service is running next to it. In ClickHouse that service is called **Keeper**. It speaks the same protocol as Apache ZooKeeper, which is why the instance manifest refers to it as `zookeeper`. This page shows how to run that service as three pods on your infra nodes, using only the ClickHouse server image this product already ships.
+ClickHouse can keep several copies of a table in sync (replication) only when a small coordination service is running next to it. In ClickHouse that service is called **Keeper**. It speaks the same protocol as Apache ZooKeeper, which is why the instance manifest refers to it under `zookeeper`.
 
-When you are done you have three Keeper pods that know about each other, reachable as `keeper-0.keeper-headless.<quorum-namespace>`, `keeper-1.keeper-headless.<quorum-namespace>` and `keeper-2.keeper-headless.<quorum-namespace>`. Those are exactly the addresses that [Configure a replicated cluster](./configure_replicated_cluster.mdx) and [Deploy as ACP logging storage](./deploy_as_logging_storage.mdx) expect, so their manifests work unchanged.
+The operator deploys and manages Keeper for you through a `ClickHouseKeeperInstallation` resource (short name `chk`). You declare how many members you want and where their data lives; the operator supplies everything else:
+
+- the container image: the same ClickHouse server image the operator gives to database pods, so the quorum always runs the build that ships with the product, and there is nothing extra to mirror in an air-gapped environment;
+- the Keeper configuration, including a distinct server id per member and the list of members;
+- a Service per member, a client Service, and a PodDisruptionBudget;
+- a security context that satisfies the Pod Security Admission `restricted` profile: user and group 101 (the `clickhouse` account built into the image), `fsGroup: 101` so the data volume is writable, no privilege escalation, all capabilities dropped.
+
+A `ClickHouseInstallation` then refers to the quorum by name. The operator waits until the quorum is ready and writes the address of every member into the ClickHouse configuration itself.
 
 ## Steps at a glance
 
 1. Check the prerequisites.
-2. Find out which server image the operator uses.
-3. Fill in two placeholders in the manifest and apply it.
-4. Check that the three members have elected a leader.
-5. Point your ClickHouse instance at the three addresses.
+2. Fill in the placeholders in the manifest and apply it.
+3. Check that the three members have elected a leader.
+4. Point your ClickHouse instance at the quorum.
 
-Plan for about fifteen minutes.
+Plan for about ten minutes.
 
 ## Before you start: what you are building
 
-- **Why three pods.** The members vote on every change, and a decision needs a majority. With three members the service keeps working when one is down and stops when two are down. Three is the smallest size that survives a failure, and it is the layout this product is tested with. A group of members like this is called a *quorum*.
-- **Why no extra image.** The operator does not install or manage Keeper, and the product has no separate Keeper image. None is needed: the `clickhouse` program inside the shipped server image also contains Keeper. The quorum is therefore an ordinary StatefulSet that you create and own, built from an image that is already in your registry. In an air-gapped environment there is nothing extra to mirror.
+- **Why three members.** The members vote on every change, and a decision needs a majority. With three members the service keeps working when one is down and stops when two are down. Three is the smallest size that survives a failure, and it is the layout this product is tested with. A group of members like this is called a *quorum*.
 - **Why infra nodes.** On ACP the infra nodes are reserved for platform services, and Keeper belongs with them. The manifest pins the pods to those nodes and spreads them so that each node holds one member.
 
 :::info
@@ -32,236 +37,94 @@ There is a second supported layout: Keeper running inside the ClickHouse pods th
 
 | You need | Details |
 |---|---|
-| The operator installed | Step 1 reads the server image from the operator's Deployment in the `operators` namespace. |
-| Three nodes for the members | On ACP these are normally the infra nodes: labelled `node-role.kubernetes.io/infra` and tainted with the same key. The manifest tolerates that taint and schedules only on nodes with that label. If you have fewer than three such nodes, delete the `podAntiAffinity` block from the manifest; two members then share a node and go down together with it. |
-| A StorageClass | The manifest uses your cluster's default StorageClass, the one `kubectl get storageclass` marks `(default)`. Any StorageClass that provides `ReadWriteOnce` volumes works. Keeper stores little data, so 10 GiB per member is plenty. |
-| A namespace | The simplest choice is the namespace your ClickHouse instance will live in. A different namespace also works; the instance then uses the full address `keeper-0.keeper-headless.<quorum-namespace>`, as shown in step 5. |
+| The operator installed | Version v4.5.0 or later. `kubectl get crd clickhousekeeperinstallations.clickhouse-keeper.altinity.com` must succeed. |
+| The quorum namespace watched by the operator | If the operator was installed for a single namespace, create the quorum in that namespace. A resource in a namespace the operator does not watch is silently ignored. |
+| Three nodes for the members | On ACP these are normally the infra nodes: labelled `node-role.kubernetes.io/infra` and tainted with the same key. The manifest tolerates that taint and schedules only on nodes with that label. If you have fewer than three such nodes, delete the `podAntiAffinity` block; two members then share a node and go down together with it. |
+| A StorageClass | Any StorageClass that provides `ReadWriteOnce` volumes. Keeper stores little data, so 10 GiB per member is plenty. Name it explicitly: on a cluster without a default StorageClass, a volume claim without a class stays `Pending`. |
+| A namespace | The simplest choice is the namespace your ClickHouse instance will live in. A different namespace also works; the instance then names it in its reference, as shown in step 3. |
 
-## Step 1: find the server image
-
-Do not type an image name by hand. Read the one the operator gives to ClickHouse pods, so that Keeper always runs the same build as the database. The registry comes from the operator's own image reference, and the repository and tag from the `CK_SERVER_IMAGE` variable on the same container:
-
-```bash
-OP=$(kubectl -n operators get deploy clickhouse-operator \
-  -o jsonpath='{.spec.template.spec.containers[?(@.name=="clickhouse-operator")].image}')
-TAG=$(kubectl -n operators get deploy clickhouse-operator \
-  -o jsonpath='{.spec.template.spec.containers[?(@.name=="clickhouse-operator")].env[?(@.name=="CK_SERVER_IMAGE")].value}')
-echo "${OP%%/*}/${TAG}"
-```
-
-The command prints one full image reference, of the form `<registry>/middleware/clickhouse-server:<tag>`. Keep it for step 2. Whenever the operator starts using a new server image, run the command again and update the quorum with the new value.
-
-## Step 2: fill in and apply the manifest
+## Step 1: fill in and apply the manifest
 
 Copy the manifest below into a file named `keeper.yaml` and replace the placeholders:
 
-| Placeholder | Replace with | Required |
-|---|---|---|
-| `<quorum-namespace>` | The namespace from the prerequisites. It appears in every resource below; replace all occurrences. | Yes |
-| `<server-image>` | The image reference printed in step 1. | Yes |
-| `<storage-class>` | Only if you do not want the default StorageClass: remove the `#` in front of `storageClassName` and put the StorageClass name here. | No |
+| Placeholder | Replace with |
+|---|---|
+| `<chk-name>` | A name for the quorum, for example `keeper`. It appears twice; replace both. |
+| `<quorum-namespace>` | The namespace from the prerequisites. |
+| `<storage-class>` | The StorageClass for the Keeper volumes. |
 
 ```yaml
-apiVersion: v1
-kind: ConfigMap
+apiVersion: clickhouse-keeper.altinity.com/v1
+kind: ClickHouseKeeperInstallation
 metadata:
-  name: keeper
-  namespace: <quorum-namespace>
-  labels:
-    app: keeper
-data:
-  keeper_config.xml: |
-    <clickhouse>
-        <logger><level>information</level><console>1</console></logger>
-        <listen_host>0.0.0.0</listen_host>
-        <max_connections>256</max_connections>
-        <keeper_server>
-            <tcp_port>2181</tcp_port>
-            <!-- rewritten from the pod ordinal at start-up; see the container command -->
-            <server_id>__SERVER_ID__</server_id>
-            <log_storage_path>/var/lib/clickhouse-keeper/coordination/log</log_storage_path>
-            <snapshot_storage_path>/var/lib/clickhouse-keeper/coordination/snapshots</snapshot_storage_path>
-            <coordination_settings>
-                <operation_timeout_ms>10000</operation_timeout_ms>
-                <session_timeout_ms>30000</session_timeout_ms>
-                <raft_logs_level>information</raft_logs_level>
-            </coordination_settings>
-            <raft_configuration>
-                <server><id>1</id><hostname>keeper-0.keeper-headless</hostname><port>9234</port></server>
-                <server><id>2</id><hostname>keeper-1.keeper-headless</hostname><port>9234</port></server>
-                <server><id>3</id><hostname>keeper-2.keeper-headless</hostname><port>9234</port></server>
-            </raft_configuration>
-        </keeper_server>
-    </clickhouse>
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: keeper-headless
-  namespace: <quorum-namespace>
-  labels:
-    app: keeper
-spec:
-  clusterIP: None
-  # Required. Members must resolve each other before any of them is Ready,
-  # otherwise the quorum never forms.
-  publishNotReadyAddresses: true
-  selector:
-    app: keeper
-  ports:
-    - name: client
-      port: 2181
-    - name: raft
-      port: 9234
----
-apiVersion: policy/v1
-kind: PodDisruptionBudget
-metadata:
-  name: keeper
+  name: <chk-name>
   namespace: <quorum-namespace>
 spec:
-  maxUnavailable: 1
-  selector:
-    matchLabels:
-      app: keeper
----
-apiVersion: apps/v1
-kind: StatefulSet
-metadata:
-  name: keeper
-  namespace: <quorum-namespace>
-  labels:
-    app: keeper
-spec:
-  serviceName: keeper-headless
-  replicas: 3
-  podManagementPolicy: Parallel
-  selector:
-    matchLabels:
-      app: keeper
-  template:
-    metadata:
-      labels:
-        app: keeper
-    spec:
-      tolerations:
-        - key: node-role.kubernetes.io/infra
-          operator: Exists
-      affinity:
-        nodeAffinity:
-          requiredDuringSchedulingIgnoredDuringExecution:
-            nodeSelectorTerms:
-              - matchExpressions:
-                  - key: node-role.kubernetes.io/infra
-                    operator: Exists
-        podAntiAffinity:
-          requiredDuringSchedulingIgnoredDuringExecution:
-            - topologyKey: kubernetes.io/hostname
-              labelSelector:
-                matchLabels:
-                  app: keeper
-      securityContext:
-        fsGroup: 101
-      containers:
-        - name: keeper
-          image: <server-image>
-          imagePullPolicy: IfNotPresent
-          command:
-            - /bin/sh
-            - -c
-            - >-
-              ORD=${HOSTNAME##*-};
-              sed "s/__SERVER_ID__/$((ORD+1))/" /etc/keeper-tpl/keeper_config.xml
-              > /var/lib/clickhouse-keeper/keeper_config.xml;
-              exec clickhouse-keeper --config-file=/var/lib/clickhouse-keeper/keeper_config.xml
-          ports:
-            - name: client
-              containerPort: 2181
-            - name: raft
-              containerPort: 9234
-          securityContext:
-            runAsNonRoot: true
-            runAsUser: 101
-            runAsGroup: 101
-            allowPrivilegeEscalation: false
-            capabilities:
-              drop: ["ALL"]
-            seccompProfile:
-              type: RuntimeDefault
+  defaults:
+    templates:
+      podTemplate: keeper-pod
+      dataVolumeClaimTemplate: keeper-data
+  configuration:
+    clusters:
+      - name: keeper
+        layout:
+          replicasCount: 3
+  templates:
+    podTemplates:
+      - name: keeper-pod
+        spec:
+          tolerations:
+            - key: node-role.kubernetes.io/infra
+              operator: Exists
+          affinity:
+            nodeAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                nodeSelectorTerms:
+                  - matchExpressions:
+                      - key: node-role.kubernetes.io/infra
+                        operator: Exists
+            podAntiAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                - topologyKey: kubernetes.io/hostname
+                  labelSelector:
+                    matchLabels:
+                      clickhouse-keeper.altinity.com/chk: <chk-name>
+    volumeClaimTemplates:
+      - name: keeper-data
+        spec:
+          accessModes:
+            - ReadWriteOnce
+          storageClassName: <storage-class>
           resources:
             requests:
-              cpu: 500m
-              memory: 512Mi
-            limits:
-              cpu: "2"
-              memory: 2Gi
-          readinessProbe:
-            tcpSocket:
-              port: 2181
-            initialDelaySeconds: 5
-            periodSeconds: 5
-            failureThreshold: 30
-          volumeMounts:
-            - name: config
-              mountPath: /etc/keeper-tpl
-            - name: data
-              mountPath: /var/lib/clickhouse-keeper
-      volumes:
-        - name: config
-          configMap:
-            name: keeper
-  volumeClaimTemplates:
-    - metadata:
-        name: data
-      spec:
-        accessModes:
-          - ReadWriteOnce
-        # storageClassName: <storage-class>   # uncomment to use a StorageClass other than the default
-        resources:
-          requests:
-            storage: 10Gi
+              storage: 10Gi
 ```
-
-The manifest contains four resources:
-
-- a **ConfigMap** holding the Keeper configuration file, including the list of the three members;
-- a **headless Service** named `keeper-headless`, which gives each pod a stable DNS name such as `keeper-0.keeper-headless`;
-- a **PodDisruptionBudget**, so that cluster maintenance never takes down more than one member at a time;
-- a **StatefulSet** with three pods, each with its own persistent volume.
 
 Points worth knowing before you change anything in it:
 
-- **Each member needs a different `server_id`, and the pod ordinal provides it.** All three pods get the same ConfigMap, so at start-up the container copies the configuration file into its data volume, replaces the `__SERVER_ID__` placeholder with its ordinal plus one (`keeper-0` becomes id 1), and starts from that copy. ConfigMap mounts are read-only, which is why the copy is needed.
-- **The member list uses short names.** `keeper-0.keeper-headless` resolves inside the quorum's own namespace, so the ConfigMap does not mention a namespace. A ClickHouse instance in a different namespace uses the full name instead (step 5).
-- **The pods run as the `restricted` Pod Security profile.** User and group 101 are the `clickhouse` account built into the image; `fsGroup` makes the volume writable for it.
-- **The readiness probe only checks that the port is open.** A member that has lost its quorum still accepts connections, so a Ready pod means the process is listening, not that the quorum is working. Step 3 checks the quorum itself.
+- **No image, command or security context.** Leave them out. The operator fills them in, and when the operator later moves to a new server image it rolls the quorum to that image as well, one member at a time.
+- **The pod template lists no containers.** Its only job is scheduling: the tolerations, the node affinity and the anti-affinity are merged into the pods the operator builds.
+- **Node drains take down one member at a time.** The operator creates a PodDisruptionBudget named `chk-<chk-name>-keeper` that covers the Keeper pods with `maxUnavailable: 1`, so cluster maintenance never stops two members at once.
+- **One cluster, three members.** `replicasCount` is the number of Keeper members. Keep it odd.
 
-Apply the file and wait for the pods:
+Apply the file and wait for the quorum:
 
 ```bash
 kubectl -n <quorum-namespace> apply -f keeper.yaml
-kubectl -n <quorum-namespace> rollout status statefulset/keeper
+kubectl -n <quorum-namespace> get chk <chk-name> -w
 ```
 
-The second command returns when all three pods are Ready. If it keeps waiting, run `kubectl -n <quorum-namespace> get pods -l app=keeper -o wide`; a pod that stays `Pending` usually means fewer than three infra nodes are available, or no StorageClass could provide the volume.
+Stop watching when `STATUS` shows `Completed`. The operator creates the members one at a time, so this takes a few minutes. If it stays at `InProgress`, list the pods with `kubectl -n <quorum-namespace> get pods -l clickhouse-keeper.altinity.com/chk=<chk-name> -o wide`; a pod that stays `Pending` usually means fewer than three infra nodes are available, or the StorageClass could not provide the volume.
 
-## Step 3: check the quorum
+## Step 2: check the quorum
 
-First, each member should report that it is ready:
-
-```bash
-for i in 0 1 2; do
-  kubectl -n <quorum-namespace> logs keeper-$i | grep -m1 'Ready for connections'
-done
-```
-
-Expect three lines, one per member, each containing `Ready for connections`.
-
-Next, ask each member which role it plays. Keeper answers a built-in status command, `mntr`, over its client port: you send the four letters and it replies with a list of statistics. The shipped image has neither `nc` nor `socat`, so the command below uses the network support built into bash:
+A `Completed` status means every member's pod is Ready. It does not by itself prove that the members agree on a leader, so ask each member which role it plays. Keeper answers a built-in status command, `mntr`, over its client port 2181: you send the four letters and it replies with a list of statistics. The image has neither `nc` nor `socat`, so the command below uses the network support built into bash:
 
 ```bash
-for i in 0 1 2; do
-  kubectl -n <quorum-namespace> exec keeper-$i -- bash -c \
+for pod in $(kubectl -n <quorum-namespace> get pods \
+    -l clickhouse-keeper.altinity.com/chk=<chk-name> -o name); do
+  echo "== ${pod}"
+  kubectl -n <quorum-namespace> exec "${pod}" -c clickhouse-keeper -- bash -c \
     'exec 3<>/dev/tcp/127.0.0.1/2181; printf mntr >&3; timeout 5 cat <&3' \
     | grep -E 'zk_server_state|zk_synced_followers'
 done
@@ -269,23 +132,26 @@ done
 
 Exactly one member reports `zk_server_state leader`, and that member also reports `zk_synced_followers 2`. The other two report `zk_server_state follower`. That is a working quorum.
 
-If a member answers `This instance is not currently serving requests`, it is running but has not joined a quorum. Check the logs of the other two members, and check with `kubectl get pods -o wide` that the three pods landed on three different nodes.
+If a member answers `This instance is not currently serving requests`, it is running but has not joined a quorum. Check the logs of the other two members, and check with `-o wide` that the three pods landed on three different nodes.
 
-## Step 4: point an instance at it
+## Step 3: point an instance at it
 
-In the ClickHouse instance manifest, list the three members under `zookeeper.nodes`:
+In the ClickHouse instance manifest, name the quorum under `zookeeper.keeper`:
 
 ```yaml
 spec:
   configuration:
     zookeeper:
-      nodes:
-        - host: keeper-0.keeper-headless.<quorum-namespace>
-        - host: keeper-1.keeper-headless.<quorum-namespace>
-        - host: keeper-2.keeper-headless.<quorum-namespace>
+      keeper:
+        name: <chk-name>
+        namespace: <quorum-namespace>
 ```
 
-List the members one by one, not the Service name. The port defaults to 2181, so you do not need to state it.
+`namespace` may be left out when the quorum is in the same namespace as the instance. You do not list addresses or ports: the operator resolves the reference to the address of every member and writes those into the ClickHouse configuration. If the quorum is not ready yet, the instance waits for it.
+
+:::warning
+Do not set `zookeeper.nodes` and `zookeeper.keeper` in the same block. The operator adds the members it resolves from `keeper` to whatever `nodes` already lists, so the instance would be configured with members of two different quorums at once.
+:::
 
 Once the instance is running, confirm from the database side that it can reach Keeper. Run this query with `clickhouse-client` inside any pod of the instance, as [Configure a replicated cluster](./configure_replicated_cluster.mdx) describes:
 
@@ -293,11 +159,103 @@ Once the instance is running, confirm from the database side that it can reach K
 SELECT name FROM system.zookeeper WHERE path = '/';
 ```
 
-It returns a short list of names, such as `clickhouse` and `keeper`. If it returns an error instead, the instance cannot reach the quorum; check the addresses in `zookeeper.nodes` and the namespace they point to.
+It returns a short list of names, such as `clickhouse` and `keeper`. If it returns an error instead, the instance cannot reach the quorum; check that `kubectl get chk` reports `Completed` and that the name and namespace in the reference are correct.
 
 ## Day-to-day operation
 
-- **Do not change the number of pods with `kubectl scale`.** The members are listed by name in `raft_configuration` inside the ConfigMap. Changing `replicas` without changing that list produces either a pod that nobody votes for or a listed member that never starts. Stay at three, or go to five by editing the StatefulSet and the ConfigMap together.
-- **Never delete the data volumes.** Deleting the StatefulSet keeps its PersistentVolumeClaims. Deleting the claims deletes the coordination data, after which every replicated table that used this quorum becomes read-only until its replicas are registered again. Treat the Keeper volumes as part of the database.
+- **Change the size through the resource, never with `kubectl scale`.** The operator owns the member StatefulSets and the member list in the Keeper configuration. Scaling a StatefulSet by hand produces a member the others do not know about.
+- **Never delete the data volumes.** Deleting the `ClickHouseKeeperInstallation` removes its pods; deleting the volume claims as well deletes the coordination data, after which every replicated table that used this quorum becomes read-only until its replicas are registered again. Treat the Keeper volumes as part of the database.
 - **Losing one member is fine; losing two is an outage.** With one member left the quorum stops serving. Replicas then go read-only (`is_readonly = 1` in `system.replicas`) and inserts into replicated tables fail with `TABLE_IS_READ_ONLY`. Service resumes by itself as soon as a second member is back.
-- **Upgrade Keeper together with the server image.** When the operator moves to a new server image, run step 1 again and set the new value in the StatefulSet. The rolling update restarts one member at a time, which a three-member quorum tolerates.
+
+## Migrate from a manual Keeper StatefulSet to ClickHouseKeeperInstallation \{#migrate-from-a-manual-keeper-statefulset-to-clickhousekeeperinstallation\}
+
+Earlier releases of this page built the quorum by hand, as a StatefulSet named `keeper` with a ConfigMap, a headless Service and a PodDisruptionBudget, and instances listed its members under `zookeeper.nodes`.
+
+**Upgrading the operator does not affect such a quorum.** The operator never managed it and does not touch it, and instances that list `zookeeper.nodes` keep working across the upgrade exactly as before. You do not have to migrate. Migrate only when you want the operator to manage the Keeper lifecycle and keep it on the product's server image for you.
+
+Moving an instance to a new quorum moves its coordination data, which the new quorum does not have. ClickHouse can rebuild that data from the table parts each replica holds on its own disk, with `SYSTEM RESTORE REPLICA`. The procedure below does that for each replicated table. It needs a maintenance window during which nothing writes to the instance's replicated tables.
+
+:::warning
+This procedure covers tables of the `ReplicatedMergeTree` family. If the instance has a database of the `Replicated` engine (`SELECT name FROM system.databases WHERE engine = 'Replicated'` returns rows), do not use it; contact support first.
+:::
+
+### 1. Create the new quorum next to the old one
+
+Follow steps 1 and 2 of this page with a name that does not clash with the old StatefulSet, for example `<chk-name>` = `keeper-managed`. The old quorum keeps serving while you do this. Continue only when step 2 shows one leader and two synced followers.
+
+### 2. Stop writes and let replication settle
+
+Stop every client that writes to the instance. Then, on each replica, wait until its replication queue is empty and record what it holds:
+
+```sql
+SYSTEM SYNC REPLICA <database>.<table>;          -- for every replicated table
+SELECT database, table, count() AS parts, sum(rows) AS rows
+FROM system.parts
+WHERE active AND database NOT IN ('system', 'INFORMATION_SCHEMA', 'information_schema')
+GROUP BY database, table
+ORDER BY database, table;
+```
+
+Keep the output of the second query from every replica. Replicas of the same shard must report the same row counts; if they do not, wait and run `SYSTEM SYNC REPLICA` again before you continue.
+
+### 3. Point the instance at the new quorum
+
+In the instance, replace the whole `zookeeper` block — remove `nodes` completely — with the reference from step 3, and set `restart: RollingUpdate` in the same change:
+
+```yaml
+spec:
+  restart: RollingUpdate
+  configuration:
+    zookeeper:
+      keeper:
+        name: keeper-managed
+        namespace: <quorum-namespace>
+```
+
+The restart is required. The new coordination settings reach the ClickHouse configuration without restarting the pods, and a running server then keeps parts of its old coordination state: in particular the queue that carries `ON CLUSTER` statements stays attached to the old quorum, so the `ON CLUSTER` statement in step 4 would time out. `restart: RollingUpdate` makes the operator restart every ClickHouse pod, one host at a time, so that each server starts cleanly against the new quorum.
+
+Apply the change and wait until the instance reports `Completed` again:
+
+```bash
+kubectl -n <namespace> get chi <instance-name> -w
+```
+
+Then remove `restart` again, so that later changes to the instance do not restart every pod:
+
+```bash
+kubectl -n <namespace> patch chi <instance-name> --type=json -p='[{"op":"remove","path":"/spec/restart"}]'
+```
+
+Do not restart the pods with `kubectl rollout restart` on the StatefulSets instead. That restarts the hosts independently of the operator and possibly at the same time, and servers that start while their peers are restarting can come up with an incomplete view of the cluster.
+
+After the restart each replicated table is read-only, because the new quorum has no record of it: `SELECT database, table FROM system.replicas WHERE is_readonly` lists them.
+
+### 4. Rebuild the coordination data
+
+On one replica, for every table listed in the previous step:
+
+```sql
+SYSTEM RESTORE REPLICA <database>.<table> ON CLUSTER '<cluster-name>';
+```
+
+`<cluster-name>` is the cluster name from the instance's `spec.configuration.clusters`. Each replica registers itself in the new quorum and re-announces the parts it holds on its own disk; nothing is copied from the old quorum.
+
+### 5. Verify, then resume writes
+
+- `SELECT database, table FROM system.replicas WHERE is_readonly` returns no rows on any replica.
+- `SELECT database, table, total_replicas, active_replicas FROM system.replicas` shows every replica of each shard as both registered and active.
+- The `system.parts` query from step 2 returns the same row counts as before, on every replica.
+
+Then restart the clients.
+
+### 6. Remove the old quorum
+
+When every instance that used the old quorum has been moved, delete its StatefulSet, Service, ConfigMap and PodDisruptionBudget. Keep its volume claims until you are sure you will not need to go back; deleting them is irreversible.
+
+To go back, do it before step 5 resumes writes: restore the previous `zookeeper.nodes` block in the instance, again together with `restart: RollingUpdate`, wait for `Completed`, and remove `restart` as in step 3. The old quorum still holds the coordination data exactly as it was in step 2, so no `SYSTEM RESTORE REPLICA` is needed. Once writes have resumed against the new quorum, the old one no longer matches the data on disk; do not switch back to it.
+
+---
+
+ClickHouse is a registered trademark of ClickHouse, Inc. https://clickhouse.com
+
+Alauda is an independent vendor. This product is not affiliated with, endorsed by, or sponsored by ClickHouse, Inc. All trademarks are the property of their respective owners and are used here for identification purposes only.

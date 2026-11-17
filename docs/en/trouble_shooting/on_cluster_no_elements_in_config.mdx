@@ -49,7 +49,18 @@ A failure here confirms the server has no coordination configured, or cannot rea
 
 ## Fix
 
-Declare the quorum. The operator does not deploy one, so it must already exist.
+Declare the quorum. The usual way is to name a `ClickHouseKeeperInstallation`, which the operator deploys and manages; create one first as described in [Deploy a Keeper quorum](../how_to/deploy_keeper_quorum.mdx):
+
+```yaml
+spec:
+  configuration:
+    zookeeper:
+      keeper:
+        name: <chk-name>
+        namespace: <quorum-namespace>
+```
+
+For a quorum you run yourself, list its members instead, and do not combine `nodes` with `keeper` in the same block:
 
 ```yaml
 spec:
@@ -88,7 +99,7 @@ Code: 999. DB::Exception: Coordination::Exception: Cannot use any of provided Zo
 The element is present but unusable: the server tried every declared address and none accepted a session. Check, in order:
 
 1. **Name resolution and reachability** from a server pod to each declared address and port.
-2. **Quorum health.** A quorum with no elected leader answers nothing useful. Check its own status.
+2. **Quorum health.** A quorum with no elected leader answers nothing useful. Check its own status; for a `ClickHouseKeeperInstallation`, `kubectl get chk` must report `Completed` and step 2 of [Deploy a Keeper quorum](../how_to/deploy_keeper_quorum.mdx) shows how to check the leader.
 3. **Root path.** If you set a root, it must already exist in the quorum; the server does not create it.
 4. **Whether the configuration reached the pod.** Configuration is delivered by mounted ConfigMap, and a mounted ConfigMap update is not instant. The operator has a configurable propagation timeout for exactly this reason. If a pod has old content, wait for the next reconcile or check the operator log.
 
