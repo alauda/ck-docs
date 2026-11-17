@@ -5,7 +5,9 @@ weight: 2
 # Architecture
 
 Alauda Data Services Analytical Database E1 is a single-Deployment operator that turns a
-`ClickHouseInstallation` (CHI) into a set of standard Kubernetes workload objects.
+`ClickHouseInstallation` (CHI) into a set of standard Kubernetes workload objects, and a
+`ClickHouseKeeperInstallation` (CHK) into the ClickHouse Keeper quorum that replicated clusters
+coordinate through.
 Nothing in the data path is custom: every ClickHouse® server instance is an ordinary
 Pod inside an ordinary StatefulSet.
 
@@ -16,7 +18,7 @@ with two containers:
 
 | Container | Binary | Role |
 |---|---|---|
-| `clickhouse-operator` | `cmd/operator` | Watches the three CRDs and reconciles Kubernetes objects |
+| `clickhouse-operator` | `cmd/operator` | Watches the four CRDs and reconciles Kubernetes objects |
 | `metrics-exporter` | `cmd/metrics_exporter` | Scrapes each ClickHouse® host and re-exposes Prometheus metrics |
 
 Pod and Service selector is the bare label `app=clickhouse-operator`,
@@ -31,6 +33,20 @@ events, no status. If a new cluster never progresses, check the install mode bef
 Five ConfigMaps are mounted under `/etc/clickhouse-operator` (`files`, `conf.d`,
 `config.d`, `templates.d`, `users.d`) and supply the operator's own configuration and
 the baseline ClickHouse® config fragments.
+
+## Custom resources
+
+| Kind | Short name | API group | What the operator builds from it |
+|---|---|---|---|
+| `ClickHouseInstallation` | `chi` | `clickhouse.altinity.com/v1` | One StatefulSet, one Service and one set of ConfigMaps per ClickHouse host, plus the instance Services |
+| `ClickHouseInstallationTemplate` | `chit` | `clickhouse.altinity.com/v1` | Nothing on its own; its content is merged into the instances that use it |
+| `ClickHouseOperatorConfiguration` | `chopconf` | `clickhouse.altinity.com/v1` | Nothing on its own; it changes the operator's behaviour |
+| `ClickHouseKeeperInstallation` | `chk` | `clickhouse-keeper.altinity.com/v1` | One StatefulSet and Service per Keeper member, a client Service and a PodDisruptionBudget |
+
+A `ClickHouseInstallation` that names a `ClickHouseKeeperInstallation` in
+`spec.configuration.zookeeper.keeper` waits until that quorum is ready, then writes the address of
+each Keeper member into the ClickHouse® configuration. The Keeper pods run the same server image as
+the ClickHouse® pods, so the quorum adds no image to the product.
 
 ## Object graph
 

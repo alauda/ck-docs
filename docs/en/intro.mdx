@@ -15,13 +15,14 @@ datasets, delivered as a Kubernetes operator. You declare the desired cluster
 topology in a custom resource; the operator renders and reconciles the StatefulSets,
 Services, ConfigMaps and PersistentVolumeClaims that implement it.
 
-Three custom resources, all in group `clickhouse.altinity.com/v1` and all namespaced:
+Four custom resources, all namespaced:
 
-| Kind | Short name | Purpose |
-|---|---|---|
-| `ClickHouseInstallation` | `chi` | One database cluster: its topology, settings and users |
-| `ClickHouseInstallationTemplate` | `chit` | Reusable fragments merged into a CHI |
-| `ClickHouseOperatorConfiguration` | `chopconf` | Operator-wide behaviour |
+| Kind | Short name | API group | Purpose |
+|---|---|---|---|
+| `ClickHouseInstallation` | `chi` | `clickhouse.altinity.com/v1` | One database cluster: its topology, settings and users |
+| `ClickHouseInstallationTemplate` | `chit` | `clickhouse.altinity.com/v1` | Reusable fragments merged into a CHI |
+| `ClickHouseOperatorConfiguration` | `chopconf` | `clickhouse.altinity.com/v1` | Operator-wide behaviour |
+| `ClickHouseKeeperInstallation` | `chk` | `clickhouse-keeper.altinity.com/v1` | A ClickHouse Keeper quorum that replicated clusters coordinate through |
 
 The operator is delivered as an OLM bundle. The OLM package name is
 `clickhouse-operator` and it installs into the
@@ -37,21 +38,20 @@ shard/replica pair — a *host* — is its own StatefulSet carrying exactly one 
 
 Replication itself is performed by the engine, not the operator. `*ReplicatedMergeTree`
 table engines and `distributed_ddl` coordinate through a ZooKeeper-compatible
-ensemble, which the cluster reaches via `spec.configuration.zookeeper.nodes`. The operator writes that
-address into each Pod's generated `<zookeeper>` configuration and propagates schema to
-newly added hosts.
+ensemble. The cluster names a `ClickHouseKeeperInstallation` under
+`spec.configuration.zookeeper.keeper`, or lists the members of an ensemble you run yourself under
+`spec.configuration.zookeeper.nodes`. The operator writes those addresses into each Pod's generated
+`<zookeeper>` configuration and propagates schema to newly added hosts.
 
 ## What it is not
 
 - **Not an OLTP database.** It is built for read-heavy analytical scanning and
   aggregation over large datasets, not for transactional workloads.
-- **No backup or restore API.** None of the three custom resources provides backup or restore.
+- **No backup or restore API.** None of the custom resources provides backup or restore.
   Data protection must be arranged outside the operator.
-- **The coordination service is not managed for you.** The CRD states plainly that
-  the operator "doesn't manage Zookeeper". You must provide a running
-  ZooKeeper-compatible ensemble and point the CR at it. There is no
-  `ClickHouseKeeperInstallation` CRD in this distribution — the shipped bundle owns
-  exactly the three CRDs listed above.
+- **No ZooKeeper.** The operator manages ClickHouse Keeper quorums through
+  `ClickHouseKeeperInstallation`; it does not deploy Apache ZooKeeper. To use ZooKeeper or a
+  Keeper ensemble you run yourself, list its members under `zookeeper.nodes`.
 
 ## Used by other Alauda products
 

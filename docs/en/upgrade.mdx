@@ -20,6 +20,43 @@ If the `Subscription` was created with `installPlanApproval: Automatic`, OLM upg
 as soon as a newer version appears in the `stable` channel. With `Manual`, an `InstallPlan` is
 created and waits for approval:
 
+```bash
+kubectl -n operators get installplan
+kubectl -n operators patch installplan <installplan-name> --type merge -p '{"spec":{"approved":true}}'
+```
+
+## Upgrade from v4.4.x to v4.5.0 \{#upgrade-from-v44x-to-v450\}
+
+v4.5.0 moves the operator to a new upstream base (Altinity clickhouse-operator 0.27.4; v4.4.x was
+built on 0.20.0) and adds the `ClickHouseKeeperInstallation` resource. What to expect:
+
+- **One rolling restart of every instance.** The new operator renders the ClickHouse® host
+  configuration and StatefulSets differently from the old one, so after the upgrade it updates each
+  instance once, one host at a time. Replicated instances stay available; an instance with a single
+  replica is unavailable while its pod restarts. Plan the operator upgrade for a maintenance window
+  if you run single-replica instances. Wait until every instance reports `Completed` before you
+  change instances or start other maintenance:
+
+  ```bash
+  kubectl get chi -A
+  ```
+
+- **Data volumes are kept.** The restart reuses each host's PersistentVolumeClaim; no data is copied
+  or moved.
+- **Keeper quorums you built yourself keep working.** The operator does not manage a hand-built
+  Keeper StatefulSet and does not touch it during the upgrade, and instances that list its members
+  under `zookeeper.nodes` keep using it. Moving to an operator-managed quorum is optional; see
+  [Migrate from a manual Keeper StatefulSet to ClickHouseKeeperInstallation](how_to/deploy_keeper_quorum.mdx#migrate-from-a-manual-keeper-statefulset-to-clickhousekeeperinstallation).
+- **The new CRD is installed with the operator.** `clickhousekeeperinstallations.clickhouse-keeper.altinity.com`
+  appears when the v4.5.0 operator is installed; the existing three CRDs are updated in place.
+
+:::warning
+Rolling the operator back to v4.4.x after you have created any `ClickHouseKeeperInstallation` is not
+supported. The v4.4.x operator does not know that resource: the Keeper quorum would no longer be
+reconciled, and instances that refer to it under `zookeeper.keeper` would lose their coordination
+settings at the next reconcile.
+:::
+
 ---
 
 ClickHouse is a registered trademark of ClickHouse, Inc. https://clickhouse.com
