@@ -28,7 +28,14 @@ kubectl -n operators patch installplan <installplan-name> --type merge -p '{"spe
 ## Upgrade from v4.4.x to v4.5.0 \{#upgrade-from-v44x-to-v450\}
 
 v4.5.0 moves the operator to a new upstream base (Altinity clickhouse-operator 0.27.4; v4.4.x was
-built on 0.20.0) and adds the `ClickHouseKeeperInstallation` resource. What to expect:
+built on 0.20.0), updates the default ClickHouse® server image from `25.8.33.6` (25.8 LTS) to
+`26.8.39.19` (26.8 LTS), and adds the `ClickHouseKeeperInstallation` resource. What to expect:
+
+- **Default server image moves to 26.8.39.19.** Instances whose pod templates omit a container
+  `image` roll to the new default `26.8.39.19` image automatically when the operator updates their
+  StatefulSets. Instances that pin an explicit `25.8.x` server image in `spec.templates.podTemplates`
+  keep that image until you update `image` to the `<registry>/eco-oss/clickhouse-group/clickhouse-server:v26.8.39.19-76ed72d8`
+  tag configured in the v4.5.0 operator Deployment's `CK_SERVER_IMAGE` environment variable.
 
 - **One rolling restart of every instance.** The new operator renders the ClickHouse® host
   configuration and StatefulSets differently from the old one, so after the upgrade it updates each
