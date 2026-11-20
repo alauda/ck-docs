@@ -34,7 +34,7 @@ built on 0.20.0), updates the default ClickHouse® server image from `25.8.33.6`
 - **Default server image moves to 26.8.39.19.** Instances whose pod templates omit a container
   `image` roll to the new default `26.8.39.19` image automatically when the operator updates their
   StatefulSets. Instances that pin an explicit `25.8.x` server image in `spec.templates.podTemplates`
-  keep that image until you update `image` to the `<registry>/eco-oss/clickhouse-group/clickhouse-server:v26.8.39.19-76ed72d8`
+  keep that image until you update `image` to the `<registry>/eco-oss/clickhouse-group/clickhouse-server:v26.8.39.19-780010d9`
   tag configured in the v4.5.0 operator Deployment's `CK_SERVER_IMAGE` environment variable.
 
 - **One rolling restart of every instance.** The new operator renders the ClickHouse® host
