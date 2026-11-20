@@ -37,7 +37,7 @@ There is a second supported layout: Keeper running inside the ClickHouse pods th
 
 | You need | Details |
 |---|---|
-| The operator installed | Version v4.5.0 or later. `kubectl get crd clickhousekeeperinstallations.clickhouse-keeper.altinity.com` must succeed. |
+| The operator installed | Version v4.5.1 or later. `kubectl get crd clickhousekeeperinstallations.clickhouse-keeper.altinity.com` must succeed. |
 | The quorum namespace watched by the operator | If the operator was installed for a single namespace, create the quorum in that namespace. A resource in a namespace the operator does not watch is silently ignored. |
 | Three nodes for the members | On ACP these are normally the infra nodes: labelled `node-role.kubernetes.io/infra` and tainted with the same key. The manifest tolerates that taint and schedules only on nodes with that label. If you have fewer than three such nodes, delete the `podAntiAffinity` block; two members then share a node and go down together with it. |
 | A StorageClass | Any StorageClass that provides `ReadWriteOnce` volumes. Keeper stores little data, so 10 GiB per member is plenty. Name it explicitly: on a cluster without a default StorageClass, a volume claim without a class stays `Pending`. |
